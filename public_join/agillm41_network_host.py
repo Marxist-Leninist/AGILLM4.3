@@ -84,6 +84,22 @@ def load_secret(path: Path) -> bytes:
     return secret
 
 
+def join_code_hash(code: str) -> str:
+    return hashlib.sha256(code.encode("utf-8")).hexdigest()
+
+
+def load_join_code(args: argparse.Namespace) -> str:
+    if args.join_code_file:
+        path = Path(args.join_code_file)
+        if not path.exists():
+            raise SystemExit(f"join-code-file not found: {path}")
+        code = path.read_text(encoding="utf-8").strip()
+        if not code:
+            raise SystemExit(f"join-code-file is empty: {path}")
+        return code
+    return args.join_code or os.environ.get("AGILLM41_JOIN_CODE", "")
+
+
 class LeaseStore:
     def __init__(self, spool: Path, secret: bytes, public_base_url: str):
         self.spool = spool
@@ -218,6 +234,7 @@ class LeaseStore:
         meta["result_file"] = str(result_path)
         meta["result_sha256"] = result_sha
         write_json(self.spool / "quarantine" / f"{lease_id}.json", meta)
+        (self.spool / "leased" / f"{lease_id}.json").unlink(missing_ok=True)
 
 
 def bearer(headers: Any) -> str:
@@ -301,6 +318,12 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.send_json(400, {"error": str(exc)})
                 return
+            required_join_hash = getattr(self.server, "join_code_hash", "")  # type: ignore[attr-defined]
+            if required_join_hash:
+                supplied = self.headers.get("X-Join-Code", "") or str(body.get("join_code", ""))
+                if not supplied or not hmac.compare_digest(join_code_hash(supplied), required_join_hash):
+                    self.send_json(403, {"error": "bad join code"})
+                    return
             lease = self.store.request(str(body.get("node_id", "unknown")), body.get("capabilities", {}))
             if lease is None:
                 self.send_response(204)
@@ -353,16 +376,28 @@ def serve(args: argparse.Namespace) -> None:
     public = args.public_base_url or f"http://{args.host}:{args.port}"
     secret = load_secret(Path(args.secret_file))
     store = LeaseStore(Path(args.spool), secret, public)
+    join_code = load_join_code(args)
     bind_public = args.host not in ("127.0.0.1", "localhost", "::1")
     if bind_public and not (args.tls_cert and args.tls_key) and not args.allow_http:
         raise SystemExit("refusing public HTTP without TLS; pass --tls-cert/--tls-key or --allow-http for testing")
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     httpd.store = store  # type: ignore[attr-defined]
+    httpd.join_code_hash = join_code_hash(join_code) if join_code else ""  # type: ignore[attr-defined]
     if args.tls_cert and args.tls_key:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(args.tls_cert, args.tls_key)
         httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
-    print(json.dumps({"event": "serve", "bind": [args.host, args.port], "public_base_url": public}), flush=True)
+    print(
+        json.dumps(
+            {
+                "event": "serve",
+                "bind": [args.host, args.port],
+                "public_base_url": public,
+                "join_code_required": bool(join_code),
+            }
+        ),
+        flush=True,
+    )
     httpd.serve_forever()
 
 
@@ -409,6 +444,8 @@ def main() -> int:
     p.add_argument("--tls-cert")
     p.add_argument("--tls-key")
     p.add_argument("--allow-http", action="store_true")
+    p.add_argument("--join-code", default="", help="optional request gate; prefer --join-code-file in production")
+    p.add_argument("--join-code-file", default=os.environ.get("AGILLM41_JOIN_CODE_FILE", ""))
     p.set_defaults(func=serve)
 
     p = sub.add_parser("add-lease", parents=[common])

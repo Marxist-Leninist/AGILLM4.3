@@ -24,6 +24,11 @@ inference is AR-first today; monolithic runtime inference supports `--mode ar`,
 
 `public_join/agillm41_join_worker.py` is an outbound-only worker for untrusted joiners. It requests short-lived leases, verifies package hashes, runs a local worker command, and submits results to quarantine rather than exposing SSH or writing directly into the master merge path.
 
+`public_join/README.md` documents the two intended public paths:
+
+- join Scott's AGILLM4.1 network as an untrusted helper with outbound-only HTTPS;
+- start your own signed-lease AGILLM4.1 worker network with quarantined results.
+
 ## Distributed Inference
 
 `distributed_infer/agillm41_distributed_infer.py` is a single-file distributed AR inference harness for the real AGILLM4.1 transformer. It splits contiguous transformer/DiffusionBlock layer ranges across local or HTTP worker stages, using the actual `Block` implementation and MoE FFNs from the checkpoint config.

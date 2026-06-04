@@ -41,7 +41,10 @@ def ssl_context(insecure: bool) -> ssl.SSLContext | None:
 
 def http_json(url: str, payload: dict[str, Any], insecure: bool) -> tuple[int, dict[str, Any] | None]:
     body = json.dumps(payload).encode("utf-8")
-    req = Request(url, data=body, method="POST", headers={"Content-Type": "application/json"})
+    headers = {"Content-Type": "application/json"}
+    if payload.get("join_code"):
+        headers["X-Join-Code"] = str(payload["join_code"])
+    req = Request(url, data=body, method="POST", headers=headers)
     try:
         with urlopen(req, context=ssl_context(insecure), timeout=60) as r:
             if r.status == 204:
@@ -111,27 +114,37 @@ def default_worker_cmd(args: argparse.Namespace, lease: dict[str, Any], package:
     worker_args = lease.get("worker_args", {})
     if not args.worker_script:
         raise RuntimeError("default mode requires --worker-script or --worker-cmd")
+    if frozen is None:
+        raise RuntimeError("default AGILLM4.1 slice worker requires a shared/frozen artifact")
+    repo_root = Path(__file__).resolve().parents[1]
+    worker_script = Path(args.worker_script)
+    if not worker_script.is_absolute() and not worker_script.exists() and (repo_root / worker_script).exists():
+        worker_script = repo_root / worker_script
+    runtime = Path(args.runtime)
+    if not runtime.is_absolute() and not runtime.exists() and (repo_root / runtime).exists():
+        runtime = repo_root / runtime
     cmd = [
         args.worker_python,
         "-u",
-        args.worker_script,
+        str(worker_script),
         "--package",
         str(package),
+        "--shared",
+        str(frozen),
+        "--runtime",
+        str(runtime),
         "--out",
         str(out),
     ]
-    if frozen:
-        cmd += ["--frozen", str(frozen)]
     for name, default in (
         ("device", args.device),
         ("threads", args.threads),
-        ("steps", args.steps),
-        ("vchunk", args.vchunk),
+        ("update-kind", args.update_kind),
+        ("worker-id", args.node_id),
     ):
         value = worker_args.get(name, default)
         if value is not None:
             cmd += [f"--{name}", str(value)]
-    cmd += ["--log-every", str(args.log_every)]
     return cmd
 
 
@@ -172,6 +185,7 @@ def once(args: argparse.Namespace) -> bool:
         {
             "node_id": node_id,
             "version": VERSION,
+            "join_code": args.join_code,
             "capabilities": {
                 "device": args.device,
                 "threads": args.threads,
@@ -216,13 +230,16 @@ def main() -> int:
     ap.add_argument("--coordinator-url", default=os.environ.get("AGILLM41_COORDINATOR_URL") or os.environ.get("AGILLM35_COORDINATOR_URL", ""))
     ap.add_argument("--workdir", default=os.environ.get("AGILLM41_JOIN_WORKDIR") or "./agillm41_join_work")
     ap.add_argument("--node-id", default=os.environ.get("AGILLM41_NODE_ID") or os.environ.get("AGILLM35_NODE_ID", ""))
+    ap.add_argument("--join-code", default=os.environ.get("AGILLM41_JOIN_CODE", ""))
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--threads", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     ap.add_argument("--steps", type=int, default=8)
     ap.add_argument("--vchunk", type=int, default=4096)
     ap.add_argument("--max-result-bytes", type=int, default=500_000_000)
     ap.add_argument("--worker-python", default=sys.executable)
-    ap.add_argument("--worker-script", default="agillm35_slice_worker.py")
+    ap.add_argument("--worker-script", default="agillm4/training_bench/agillm4_slice_bench_worker.py")
+    ap.add_argument("--runtime", default="agillm41.py")
+    ap.add_argument("--update-kind", default="agillm41_dblock_public_join_update")
     ap.add_argument("--worker-cmd", default="", help="optional shell command template using {package}, {out}, {frozen}")
     ap.add_argument("--log-every", type=int, default=4)
     ap.add_argument("--loop", action="store_true")
