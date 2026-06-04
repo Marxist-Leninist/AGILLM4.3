@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+ckpts*/
+*.pt
+*.tmp
+.env
