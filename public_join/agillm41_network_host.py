@@ -217,6 +217,20 @@ class LeaseStore:
             src.unlink()
         return self.public_lease(lease, token)
 
+    _PKG_ROOT = "/root/agillm41_worker/packages"
+
+    def _pkg_static_url(self, fp: str):
+        try:
+            import os
+            if not fp:
+                return None
+            rp = os.path.relpath(fp, self._PKG_ROOT)
+            if rp.startswith("..") or os.path.isabs(rp):
+                return None
+            return self.public_base_url + "/pkg/" + rp
+        except Exception:
+            return None
+
     def public_lease(self, lease: dict[str, Any], token: str) -> dict[str, Any]:
         lease_id = lease["lease_id"]
         out = {
@@ -225,7 +239,7 @@ class LeaseStore:
             "token": token,
             "expires_at": lease["expires_at"],
             "package": {
-                "url": f"{self.public_base_url}/api/v1/leases/{lease_id}/package",
+                "url": (self._pkg_static_url(lease["package"].get("path", "")) or f"{self.public_base_url}/api/v1/leases/{lease_id}/package"),
                 "sha256": lease["package"]["sha256"],
                 "bytes": lease["package"]["bytes"],
                 "name": lease["package"]["name"],
@@ -241,7 +255,7 @@ class LeaseStore:
         }
         if "frozen" in lease:
             out["frozen"] = {
-                "url": f"{self.public_base_url}/api/v1/leases/{lease_id}/frozen",
+                "url": (self._pkg_static_url(lease["frozen"].get("path", "")) or f"{self.public_base_url}/api/v1/leases/{lease_id}/frozen"),
                 "sha256": lease["frozen"]["sha256"],
                 "bytes": lease["frozen"]["bytes"],
                 "name": lease["frozen"]["name"],

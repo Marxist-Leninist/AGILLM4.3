@@ -90,6 +90,8 @@ def main() -> int:
     ap.add_argument("--steps", type=int, default=1)
     ap.add_argument("--batch-size", type=int, default=1)
     ap.add_argument("--block-size", type=int, default=128)
+    ap.add_argument("--max-layers", type=int, default=0, help="export only N layers of the block (rotating window) for low-RAM nodes")
+    ap.add_argument("--layer-offset", type=int, default=0, help="rotating start offset within block layer list")
     ap.add_argument("--seed", type=int, default=20260602)
     ap.add_argument("--runtime", default="agillm41.py", help="AGILLM4.1 runtime path used when --source is set")
     ap.add_argument("--source", default="", help="Real token source. Use __default__ for the runtime default pretrain mix; empty keeps synthetic benchmark IDs.")
@@ -173,6 +175,10 @@ def main() -> int:
 
     for idx, (worker_id, block_id) in enumerate(workers):
         layers = assignments[int(block_id)]
+        if int(args.max_layers) > 0 and len(layers) > int(args.max_layers):
+            _n = int(args.max_layers); _off = int(args.layer_offset) % len(layers)
+            _rot = layers[_off:] + layers[:_off]
+            layers = sorted(_rot[:_n])
         batch_seed = args.seed + idx * 1009
         if runtime is not None:
             ids = real_token_batches(runtime, args.source, args.steps, args.batch_size, args.block_size, batch_seed)

@@ -195,6 +195,7 @@ def main() -> int:
     ap.add_argument("--threads", type=int, default=2)
     ap.add_argument("--update-kind", default="agillm41_dblock_slice_update")
     ap.add_argument("--worker-id", default="", help="override package worker_id in the emitted update")
+    ap.add_argument("--low_mem", action="store_true", help="SGD + free frozen tensors to fit low-RAM (3GB) nodes")
     args = ap.parse_args()
 
     torch.set_num_threads(max(1, int(args.threads)))
@@ -233,8 +234,17 @@ def main() -> int:
         for p in module.parameters():
             p.requires_grad = False
     core.train()
+    if args.low_mem:
+        import gc
+        try:
+            pkg.pop('block_state', None)
+            shared.clear()
+            del local_sd
+        except Exception:
+            pass
+        gc.collect()
 
-    opt = torch.optim.AdamW([p for p in core.blocks.parameters() if p.requires_grad], lr=1e-5)
+    opt = (torch.optim.SGD([p for p in core.blocks.parameters() if p.requires_grad], lr=1e-3, momentum=0.0) if args.low_mem else torch.optim.AdamW([p for p in core.blocks.parameters() if p.requires_grad], lr=1e-5))
     try:
         scaler = torch.amp.GradScaler("cuda", enabled=False)
     except Exception:
