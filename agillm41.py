@@ -641,6 +641,21 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
         _update_stats(state, bi, total_val)
         return total_val
 
+    _spike_k = float(getattr(args, "loss_spike_skip", 0.0))
+    if _spike_k > 0.0:
+        _ema = state.get("spike_ema")
+        if _ema is not None and math.isfinite(_ema) and math.isfinite(raw_avg_val) and raw_avg_val > _spike_k * _ema:
+            opt.zero_grad(set_to_none=True)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            print(f"[dblock] loss spike raw_avg={raw_avg_val:.2f} > {_spike_k}x EMA={_ema:.2f}; skipped optimizer step", flush=True)
+            _profile_toc(state, "step_total", _step_t)
+            _profile_step_done(state, args)
+            _update_stats(state, bi, total_val)
+            return total_val
+        if math.isfinite(raw_avg_val):
+            state["spike_ema"] = raw_avg_val if _ema is None else (0.98 * _ema + 0.02 * raw_avg_val)
+
     _t = _profile_tic(prof)
     scaler.unscale_(opt)
     nn.utils.clip_grad_norm_([p for g in opt.param_groups for p in g["params"]], 1.0)
@@ -4254,6 +4269,8 @@ def main():
                     help="Weight for the MoE load-balance (Switch) aux loss. 0 disables (legacy). ~0.01 keeps both experts utilised under top-1 routing. Checkpoint-safe (router recomputed outside the checkpoint).")
     tr.add_argument("--moe_z_coef", type=float, default=0.0,
                     help="Weight for the MoE router z-loss (router-logit magnitude regularizer). 0 disables. ~0.001 stabilizes routing.")
+    tr.add_argument("--loss_spike_skip", type=float, default=0.0,
+                    help="Skip the optimizer step when the mean raw CE exceeds this multiple of its EMA (dblock path). 0 disables. ~3.0 drops pathological noisy-batch spikes.")
     tr.add_argument("--dblock", action="store_true", help="DiffusionBlocks block-wise denoising training (low VRAM).")
     tr.add_argument("--dblock_blocks", type=int, default=4, help="Partition layers into this many DiffusionBlocks blocks.")
     tr.add_argument("--dblock_schedule", choices=["random", "roundrobin", "loss_balanced"], default="loss_balanced",
