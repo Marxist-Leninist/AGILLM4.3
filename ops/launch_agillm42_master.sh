@@ -17,13 +17,20 @@ exec >> /workspace/agillm41_master_train.log 2>&1
 echo "LAUNCH_AGILLM42_MASTER (tie_kv) $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 SEED_DELTA="$SAVE_DIR/agillm42_tiekv_seed.delta.pt"
 RESUME_DELTA="$SAVE_DIR/agillm42_resume.delta.pt"
+RESUME_MARK="$SAVE_DIR/.agillm42_resume.step"
+# Disk hygiene: clear partial saves left by a crashed/OOM-killed write so they
+# cannot accumulate and wedge the disk (a full disk -> "No usable temporary
+# directory" -> watchdog crash-loop). Keep only the newest 2 full checkpoints.
+rm -f "$SAVE_DIR"/*.tmp 2>/dev/null || true
+ls -1t "$SAVE_DIR"/pretrain_step*.pt 2>/dev/null | tail -n +3 | xargs -r rm -f 2>/dev/null || true
 # Resume from the newest FULL checkpoint, but as a weights-only delta: this resets
 # the (8-bit, paged) optimizer and preserves step/seen_tok, which fits in VRAM at B=6.
-# A plain --resume reloads full optimizer state and OOMs the 4090.
+# A plain --resume reloads full optimizer state and OOMs the 4090. Skip the (4GB)
+# rewrite when the resume delta already matches the newest checkpoint step.
 CONV=0
-python3 - "$SAVE_DIR" "$RESUME_DELTA" <<'PY' || CONV=$?
-import json, os, sys, glob, torch
-d, out = sys.argv[1], sys.argv[2]
+python3 - "$SAVE_DIR" "$RESUME_DELTA" "$RESUME_MARK" <<'PY' || CONV=$?
+import json, os, sys, glob, re, torch
+d, out, mark = sys.argv[1], sys.argv[2], sys.argv[3]
 src = ""
 try:
     src = json.load(open(os.path.join(d, "latest.json"))).get("path", "")
@@ -34,6 +41,13 @@ if not src or not os.path.exists(src):
     src = c[-1] if c else ""
 if not src:
     sys.exit(3)
+m = re.search(r"step0*([0-9]+)", os.path.basename(src)); fstep = m.group(1) if m else ""
+if fstep and os.path.exists(out) and os.path.exists(mark):
+    try:
+        if open(mark).read().strip() == fstep:
+            print("resume delta already current at step", fstep); sys.exit(0)
+    except Exception:
+        pass
 ck = torch.load(src, map_location="cpu", weights_only=False)
 delta = {"delta": True,
          "weights": {k: ck[k] for k in ("core", "ar", "sat", "nat") if k in ck},
@@ -41,6 +55,8 @@ delta = {"delta": True,
          "cfg": ck.get("cfg")}
 tmp = out + ".tmp"
 torch.save(delta, tmp); os.replace(tmp, out)
+if fstep:
+    open(mark, "w").write(fstep)
 print("converted %s -> resume delta step %s" % (os.path.basename(src), delta["step"]))
 PY
 if [ "$CONV" -eq 0 ] && [ -f "$RESUME_DELTA" ]; then
