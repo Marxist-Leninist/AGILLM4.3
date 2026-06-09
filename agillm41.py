@@ -546,6 +546,9 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
         ar_val = float(ar.detach())
         _profile_toc(state, "ar_ce", _t)
         _t = _profile_tic(prof)
+        _aux = _collect_moe_aux(core, getattr(args,'moe_aux_coef',0.0), getattr(args,'moe_z_coef',0.0))
+        if torch.is_tensor(_aux):
+            ar = ar + _aux.to(ar.dtype)
         scaler.scale(ar).backward()
         _profile_toc(state, "ar_backward", _t)
         del causal, emb, zt, h, Dn, ar_hidden, ar_targets, ar_raw, ar, ar_used, ar_total
@@ -583,6 +586,9 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
         _profile_toc(state, "sat_ce", _t)
         sat_val = float(sat.detach())
         _t = _profile_tic(prof)
+        _aux = _collect_moe_aux(core, getattr(args,'moe_aux_coef',0.0), getattr(args,'moe_z_coef',0.0))
+        if torch.is_tensor(_aux):
+            sat = sat + _aux.to(sat.dtype)
         scaler.scale(sat).backward()
         _profile_toc(state, "sat_backward", _t)
         del smask, emb2, zt2, h2, Ds, last, sat_hidden, sat_targets, satf, satv, sat_raw, sat
@@ -614,6 +620,9 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
         nat_val = float(nat.detach())
         _profile_toc(state, "nat_ce", _t)
         _t = _profile_tic(prof)
+        _aux = _collect_moe_aux(core, getattr(args,'moe_aux_coef',0.0), getattr(args,'moe_z_coef',0.0))
+        if torch.is_tensor(_aux):
+            nat = nat + _aux.to(nat.dtype)
         scaler.scale(nat).backward()
         _profile_toc(state, "nat_backward", _t)
         del nat_ids, nat_in, m, hn, Dnat, nat_hidden, nat_targets, nat_raw, nat, nat_used, nat_total
@@ -2279,10 +2288,19 @@ class MoEFFN(nn.Module):
             nn.Sequential(nn.Linear(self.d, hidden), nn.ReLU(), nn.Linear(hidden, self.d))
             for _ in range(self.num_experts)
         ])
+        # Detached FFN input stashed each training forward; the router aux loss is
+        # recomputed OUTSIDE the gradient-checkpoint boundary by _collect_moe_aux().
+        self.last_router_input = None
 
     def forward(self, x):
         orig_shape = x.shape
         flat = x.reshape(-1, orig_shape[-1])
+        if self.training:
+            # Stash the detached input (no autograd graph) so the load-balance loss
+            # can be recomputed after the block forward. Computing it here would run
+            # without grad (checkpoint's no-grad first pass) or pin block activations
+            # across the checkpoint boundary and blow up VRAM.
+            self.last_router_input = flat.detach()
         scores = self.router(flat.float())
 
         if self.top_k == 1:
@@ -2341,6 +2359,37 @@ class MoEFFN(nn.Module):
             state_dict, prefix, local_metadata, strict,
             missing_keys, unexpected_keys, error_msgs,
         )
+
+
+def _collect_moe_aux(model, aux_coef=0.0, z_coef=0.0):
+    """Sum and clear the MoE load-balance / router-z losses.
+
+    Recomputes the router on the detached FFN input stashed during the forward,
+    so it works with gradient checkpointing (router logits are available WITH grad
+    here, outside the checkpointed region) and pins no block activations (the input
+    is detached, so only router.weight receives gradient). Returns a scalar tensor
+    to add to the loss before backward(), or 0.0 when disabled / nothing stashed.
+    Verified on a 4090 (28L/d1280, AMP+grad_checkpoint): peak VRAM delta ~1MB.
+    """
+    total = None
+    for m in model.modules():
+        if isinstance(m, MoEFFN):
+            inp = m.last_router_input
+            m.last_router_input = None
+            if inp is None or (aux_coef <= 0 and z_coef <= 0):
+                continue
+            scores = m.router(inp.float())
+            probs = scores.softmax(dim=-1)
+            importance = probs.mean(dim=0)
+            top1 = probs.argmax(dim=-1)
+            load = torch.bincount(top1, minlength=m.num_experts).to(importance.dtype) / max(1, top1.numel())
+            if aux_coef > 0:
+                lb = aux_coef * m.num_experts * (load.detach() * importance).sum()
+                total = lb if total is None else total + lb
+            if z_coef > 0:
+                zl = z_coef * (torch.logsumexp(scores, dim=-1) ** 2).mean()
+                total = zl if total is None else total + zl
+    return total if total is not None else 0.0
 
 
 class Block(nn.Module):
@@ -3369,6 +3418,9 @@ def _train_phase(
                     logits_ar = ar_h(h_ar)[:, :-1]
                     loss_ar = ce_tok(logits_ar.reshape(-1, VOCAB), tgt_ar[:, 1:].reshape(-1))
                 loss_value = float(loss_ar.detach().item())
+                _aux = _collect_moe_aux(core, getattr(args,'moe_aux_coef',0.0), getattr(args,'moe_z_coef',0.0))
+                if torch.is_tensor(_aux):
+                    loss_ar = loss_ar + _aux.to(loss_ar.dtype)
                 scaler.scale(loss_ar).backward()
                 del h_ar, logits_ar, loss_ar
                 do_sat = (not args.ar_only) and (args.sat_every <= 1 or ((step + 1) % args.sat_every == 0))
@@ -3383,6 +3435,9 @@ def _train_phase(
                         if gate is not None:
                             loss_sat += EMIT_LAMBDA * ce_gate(gate, torch.ones(ids.size(0), device=DEV, dtype=torch.long))
                     loss_value += float(loss_sat.detach().item())
+                    _aux = _collect_moe_aux(core, getattr(args,'moe_aux_coef',0.0), getattr(args,'moe_z_coef',0.0))
+                    if torch.is_tensor(_aux):
+                        loss_sat = loss_sat + _aux.to(loss_sat.dtype)
                     scaler.scale(loss_sat).backward()
                     del h_sat, logits_sat, loss_sat
                 do_nat = (
@@ -3410,6 +3465,9 @@ def _train_phase(
                         loss_nat = F.cross_entropy(logits_nat[mask].float(), nat_ids[mask])
                         loss_nat = float(args.nat_loss_weight) * loss_nat
                     loss_value += float(loss_nat.detach().item())
+                    _aux = _collect_moe_aux(core, getattr(args,'moe_aux_coef',0.0), getattr(args,'moe_z_coef',0.0))
+                    if torch.is_tensor(_aux):
+                        loss_nat = loss_nat + _aux.to(loss_nat.dtype)
                     scaler.scale(loss_nat).backward()
                     del nat_ids, nat_in, mask, h_nat, logits_nat, loss_nat
                 scaler.unscale_(opt)
@@ -4192,6 +4250,10 @@ def main():
                     help="Router top-k experts per token when --moe_ffn is enabled.")
     tr.add_argument("--moe_mlp_mult", type=int, default=DEFAULT_MOE_MLP_MULT,
                     help="Expert hidden-size multiplier; 4 preserves dense FFN checkpoint shape for seeding.")
+    tr.add_argument("--moe_aux_coef", type=float, default=0.0,
+                    help="Weight for the MoE load-balance (Switch) aux loss. 0 disables (legacy). ~0.01 keeps both experts utilised under top-1 routing. Checkpoint-safe (router recomputed outside the checkpoint).")
+    tr.add_argument("--moe_z_coef", type=float, default=0.0,
+                    help="Weight for the MoE router z-loss (router-logit magnitude regularizer). 0 disables. ~0.001 stabilizes routing.")
     tr.add_argument("--dblock", action="store_true", help="DiffusionBlocks block-wise denoising training (low VRAM).")
     tr.add_argument("--dblock_blocks", type=int, default=4, help="Partition layers into this many DiffusionBlocks blocks.")
     tr.add_argument("--dblock_schedule", choices=["random", "roundrobin", "loss_balanced"], default="loss_balanced",

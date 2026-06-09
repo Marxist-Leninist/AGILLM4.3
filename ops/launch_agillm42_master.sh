@@ -56,7 +56,7 @@ exec python -u agillm41.py train --preset agillm4_floor --tie_kv $RESUME_ARG \
   --dblock_sigma_curriculum_steps 2000 --dblock_log_every 25 --dblock_objective_mode stochastic \
   --dblock_ar_prob 0.70 --dblock_sat_prob 0.15 --dblock_nat_prob 0.15 \
   --dblock_ar_loss_tokens 512 --dblock_sat_loss_tokens 0 --dblock_nat_loss_tokens 512 \
-  --moe_ffn --moe_experts 2 --moe_top_k 1 --moe_mlp_mult 4 \
+  --moe_ffn --moe_experts 2 --moe_top_k 1 --moe_mlp_mult 4 --moe_aux_coef 0.01 --moe_z_coef 0.001 \
   --tie_weights --batch_size 6 --block 1024 --amp --attn_backend sublinear \
   --sublinear_window 128 --sublinear_stride 128 --sublinear_max_anchors 128 --sublinear_chunk 128 \
   --sublinear_sinks 4 --sublinear_recent_anchors 64 --no-sublinear_pooled_landmarks \
