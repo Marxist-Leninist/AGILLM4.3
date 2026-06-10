@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# AGILLM-4.3: 4.2 + shared experts (DeepSeek/ST-MoE style). same arch (Transformer + MoE + DiffusionBlocks + sublinear), tie_kv.
+# AGILLM-4.3: 4.2 warm-started + shared experts (DeepSeek/ST-MoE style, zero-init output).
+# Takes over the production lineage: resumes weights-only from the newest 4.2 full
+# checkpoint in the same save dir (missing shared.* keys init fresh = exact 4.2 at
+# step 0), sheds optimizer state, then the shared path learns to contribute.
 # Reuses the agillm4.1 distributed stack (same save dir + side_updates).
 set -Eeuo pipefail
 cd /workspace/agillm41-mainline
@@ -15,14 +18,14 @@ fi
 if [ -f /root/.cache/huggingface/token ]; then
   HF_TOKEN="$(tr -d '\r\n' </root/.cache/huggingface/token)"; export HF_TOKEN HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
 fi
-SAVE_DIR=/workspace/agillm43_4090_ckpts
+SAVE_DIR=/workspace/agillm4_4090_ckpts
 SIDE_DIR=/workspace/agillm41_side_updates
 mkdir -p "$SAVE_DIR" "$SIDE_DIR/incoming" "$SIDE_DIR/accepted" "$SIDE_DIR/rejected"
 exec >> /workspace/agillm41_master_train.log 2>&1
-echo "LAUNCH_AGILLM42_MASTER (tie_kv) $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "LAUNCH_AGILLM43_MASTER (tie_kv + shared experts) $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 SEED_DELTA="$SAVE_DIR/agillm42_tiekv_seed.delta.pt"
-RESUME_DELTA="${SHM_DIR:-/dev/shm}/agillm42_resume.delta.pt"; [ -d /dev/shm ] && [ -w /dev/shm ] || RESUME_DELTA="$SAVE_DIR/agillm42_resume.delta.pt"
-RESUME_MARK="$(dirname "$RESUME_DELTA")/.agillm42_resume.step"
+RESUME_DELTA="${SHM_DIR:-/dev/shm}/agillm43_resume.delta.pt"; [ -d /dev/shm ] && [ -w /dev/shm ] || RESUME_DELTA="$SAVE_DIR/agillm43_resume.delta.pt"
+RESUME_MARK="$(dirname "$RESUME_DELTA")/.agillm43_resume.step"
 # Disk hygiene: clear partial saves left by a crashed/OOM-killed write so they
 # cannot accumulate and wedge the disk (a full disk -> "No usable temporary
 # directory" -> watchdog crash-loop). Keep only the newest 2 full checkpoints.

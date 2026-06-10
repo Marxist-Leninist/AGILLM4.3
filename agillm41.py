@@ -2817,11 +2817,42 @@ def _expand_dense_ffn_to_moe_state_dict(sd: dict, target_sd: dict) -> dict:
     return out
 
 
+def _reconcile_shared_expert_keys(sd: dict, target_sd: dict) -> dict:
+    """Warm-start compat between shared-expert (4.3) and shared-less (4.2) checkpoints.
+
+    - Shared-less checkpoint into a model WITH shared experts: fill the missing
+      `.ff.shared.` keys from the freshly initialised module values. The shared
+      output layer is zero-initialised, so the warm-started model is numerically
+      identical to the source checkpoint at step 0 (it then learns to contribute).
+    - Shared-expert checkpoint into a model WITHOUT them: drop the `.ff.shared.`
+      keys (everything transferable is kept; only the shared path is shed).
+    """
+    if not isinstance(sd, dict) or not isinstance(target_sd, dict):
+        return sd
+    out = dict(sd)
+    filled = 0
+    dropped = 0
+    for key, target in target_sd.items():
+        if isinstance(key, str) and ".ff.shared." in key and key not in out and torch.is_tensor(target):
+            out[key] = target.detach().clone()
+            filled += 1
+    for key in list(out.keys()):
+        if isinstance(key, str) and ".ff.shared." in key and key not in target_sd:
+            out.pop(key)
+            dropped += 1
+    if filled:
+        print(f"[warm-start] shared experts: {filled} keys init fresh (zero-init no-op)", flush=True)
+    if dropped:
+        print(f"[warm-start] shared experts: {dropped} checkpoint keys dropped (model has none)", flush=True)
+    return out
+
+
 def _prepare_core_state_dict_for_load(core: nn.Module, sd: dict) -> dict:
     sd = _strip_orig_mod_prefix(sd)
     sd = _fuse_qkv_in_state_dict(dict(sd)) if isinstance(sd, dict) else sd
     if isinstance(sd, dict):
         sd = _expand_dense_ffn_to_moe_state_dict(sd, core.state_dict())
+        sd = _reconcile_shared_expert_keys(sd, core.state_dict())
     return sd
 
 
