@@ -1,0 +1,16 @@
+{
+  "datasets": [
+    "json:/workspace/agillm_math_numeracy_synth/train.jsonl|0.5",
+    "OpenTransformer/goddess-crawl|1.0",
+    "OpenTransformer/agillm-crawl-data|1.0",
+    "OpenTransformer/web-crawl-2026|1.0",
+    "OpenTransformer/web-crawl-clean-v2|1.0",
+    "OpenTransformer/sft-data-clean|1.0",
+    "OpenTransformer/web-crawl-v1|1.0",
+    "HuggingFaceFW/fineweb|2.0",
+    "HuggingFaceFW/fineweb-edu|4.0",
+    "HuggingFaceTB/smollm-corpus:cosmopedia-v2|2.0",
+    "wikimedia/wikipedia:20231101.en|2.0",
+    "allenai/c4:en|2.0"
+  ]
+}

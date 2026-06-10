@@ -563,28 +563,28 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
             for lpos, li in enumerate(layers):
                 h2 = _run_block(core.blocks[li], h2, smask, _dblock_checkpoint_this_layer(args, use_layer_checkpoint, lpos, len(layers)), args)
             Ds = core.ln(cs * zt2 + co * h2)
-            last = Ds[:, -SATB:]
         _profile_toc(state, "sat_forward", _t)
         _t = _profile_tic(prof)
-        # SAT inference uses the last context block to emit the next block.
-        # Train the same contract: previous SAT block -> following SAT block.
-        sat_ctx = Ds[:, -2 * SATB : -SATB]
-        sat_tgt = ids[:, -SATB:]
-        if sat_ctx.size(1) != sat_tgt.size(1):
+        # SAT decode uses the latest SAT_BLOCK hidden states to emit the next
+        # SAT_BLOCK tokens. Train that contract densely across the context.
+        sat_ctx = Ds[:, :-SATB]
+        sat_tgt = ids[:, SATB:]
+        if sat_ctx.size(1) == 0 or sat_ctx.size(1) != sat_tgt.size(1):
             sat_ctx = Ds[:, :-1]
             sat_tgt = ids[:, 1:]
         sat_hidden, sat_targets, sat_used, sat_total = _sample_token_loss_inputs(
             sat_ctx, sat_tgt, int(getattr(args, "dblock_sat_loss_tokens", 0))
         )
+        sat_gate_ctx = sat_ctx[:, ::SATB]
         with M.amp(args.amp):
             satf = fused_ce(sat_hidden, sat_h.proj.weight, sat_targets)
             satv = (
                 M.EMIT_LAMBDA
                 * F.cross_entropy(
-                    sat_h.gate(sat_ctx[:, 0].float()),
-                    torch.ones(ids.size(0), dtype=torch.long, device=ids.device),
+                    sat_h.gate(sat_gate_ctx.reshape(-1, sat_gate_ctx.size(-1)).float()),
+                    torch.ones(sat_gate_ctx.numel() // sat_gate_ctx.size(-1), dtype=torch.long, device=ids.device),
                 )
-                if sat_h.gate is not None and sat_ctx.size(1) > 0
+                if sat_h.gate is not None and sat_gate_ctx.size(1) > 0
                 else 0.0
             )
             sat_raw = satf + satv
@@ -598,7 +598,7 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
             sat = sat + _aux.to(sat.dtype)
         scaler.scale(sat).backward()
         _profile_toc(state, "sat_backward", _t)
-        del smask, emb2, zt2, h2, Ds, last, sat_hidden, sat_targets, satf, satv, sat_raw, sat
+        del smask, emb2, zt2, h2, Ds, sat_hidden, sat_targets, sat_gate_ctx, satf, satv, sat_raw, sat
 
     if run_nat:
         ratio = min(max(float(getattr(args, "nat_mask_ratio", 0.5)), 0.05), 0.95)
@@ -1852,13 +1852,32 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
                  sft_add_generation_prompt: bool = False, dataset_field_text: str = "text",
                  streaming: bool = True):
     ds_names = get_hot_datasets(ds_names)  # HOT LOAD
-    sources = [s.strip() for s in ds_names.split(",") if s.strip()]
-    if not sources: return
-    src_idx = 0; emitted = 0; it = None; attempts = 0; backoff_base = 2.0
+    raw = [s.strip() for s in ds_names.split(",") if s.strip()]
+    if not raw: return
+    # Weighted interleave across sources ("ref|weight", default 1.0). The old loop
+    # streamed source[0] to exhaustion before touching source[1], so whatever was
+    # listed first (the math synth jsonl) dominated every (re)started stream.
+    sources, weights = [], []
+    for s in raw:
+        w = 1.0
+        head, sep, tail = s.rpartition("|")
+        if sep:
+            try:
+                w = float(tail); s = head
+            except ValueError:
+                pass
+        sources.append(s); weights.append(max(w, 0.0))
+    if sum(weights) <= 0:
+        weights = [1.0] * len(sources)
+    _rng = random.Random(seed)
+    its = [None] * len(sources)
+    src_idx = 0; emitted = 0; attempts = 0; backoff_base = 2.0
     while emitted < target:
+        src_idx = _rng.choices(range(len(sources)), weights=weights)[0]
         try:
-            if it is None: it = _open_stream_one(sources[src_idx], seed, streaming=streaming)
-            ex = next(it)
+            if its[src_idx] is None:
+                its[src_idx] = _open_stream_one(sources[src_idx], seed + src_idx, streaming=streaming)
+            ex = next(its[src_idx])
             text = None
             if isinstance(ex, dict):
                 if chat:
@@ -1879,14 +1898,12 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
                 if emitted >= target: return
             attempts = 0
         except StopIteration:
-            it = None; src_idx = (src_idx + 1) % len(sources)
+            its[src_idx] = None  # exhausted: reopen on next pick (stream cycles)
         except Exception as e:
             attempts += 1
             sleep_s = min(60.0, backoff_base ** min(attempts, 6))
             print(f"[stream-retry] {sources[src_idx]} error: {type(e).__name__}, sleeping {sleep_s:.1f}s")
-            time.sleep(sleep_s); it = None
-            if attempts % 5 == 0 and len(sources) > 1:
-                src_idx = (src_idx + 1) % len(sources)
+            time.sleep(sleep_s); its[src_idx] = None
 
 # ───────────────────────── ALiBi ─────────────────────────
 def _alibi_slopes(n_heads: int):
@@ -3795,15 +3812,21 @@ def _train_phase(
                     # only one core-forward activation graph live at a time on 24GB cards.
                     with amp(args.amp):
                         h_sat = core(ids, sat_mask(ids.size(1), structured=use_structured_masks(args)))
-                        sat_ctx = h_sat[:, -2 * SAT_BLOCK : -SAT_BLOCK]
-                        tgt_sat = ids[:, -SAT_BLOCK:]
-                        if sat_ctx.size(1) != tgt_sat.size(1):
+                        sat_ctx = h_sat[:, :-SAT_BLOCK]
+                        tgt_sat = ids[:, SAT_BLOCK:]
+                        if sat_ctx.size(1) == 0 or sat_ctx.size(1) != tgt_sat.size(1):
                             sat_ctx = h_sat[:, :-1]
                             tgt_sat = ids[:, 1:]
-                        logits_sat, gate = sat_h(sat_ctx)
+                        logits_sat = sat_h.proj(sat_ctx)
                         loss_sat = ce_tok(logits_sat.reshape(-1, VOCAB), tgt_sat.reshape(-1))
-                        if gate is not None:
-                            loss_sat += EMIT_LAMBDA * ce_gate(gate, torch.ones(ids.size(0), device=DEV, dtype=torch.long))
+                        if sat_h.gate is not None:
+                            sat_gate_ctx = sat_ctx[:, ::SAT_BLOCK]
+                            gate_targets = torch.ones(
+                                sat_gate_ctx.numel() // sat_gate_ctx.size(-1), device=DEV, dtype=torch.long
+                            )
+                            loss_sat += EMIT_LAMBDA * ce_gate(
+                                sat_h.gate(sat_gate_ctx.reshape(-1, sat_gate_ctx.size(-1))), gate_targets
+                            )
                     loss_value += float(loss_sat.detach().item())
                     _aux = _collect_moe_aux(core, getattr(args,'moe_aux_coef',0.0), getattr(args,'moe_z_coef',0.0))
                     if torch.is_tensor(_aux):
@@ -4183,8 +4206,8 @@ def _apply_penalties(logits, ids, n, rep_p, pres_p, freq_p):
         logits[..., uniq] = torch.where(sel > 0, sel / rep_p, sel * rep_p)
     return logits
 
-def _suppress_eos(logits, args):
-    if getattr(args, "ignore_eos", False) and EOS is not None:
+def _suppress_eos(logits, args, force=False):
+    if (force or getattr(args, "ignore_eos", False)) and EOS is not None:
         logits = logits.clone()
         logits[..., int(EOS)] = -1e9
     return logits
@@ -4288,6 +4311,9 @@ def infer(args):
         if args.frequency_penalty is None: args.frequency_penalty = 1.0
         if args.penalty_last_n is None: args.penalty_last_n = 512
         if args.var is None: args.var = False
+    min_new = int(getattr(args, "min_new", 0) or 0)
+    if args.mode == "sat":
+        min_new = max(min_new, SAT_BLOCK)
     path = _resolve_ckpt(pathlib.Path(args.ckpt)) or pathlib.Path(args.ckpt)
     sd = torch.load(path, map_location="cpu")
     # Restore tokenizer from checkpoint if available
@@ -4467,7 +4493,7 @@ def infer(args):
         while ids.size(1) % SAT_BLOCK != 0 and added < args.max_new:
             logits = ar_h(h)[:, -1]
             logits = _apply_penalties(logits, ids, args.penalty_last_n, args.repetition_penalty, args.presence_penalty, args.frequency_penalty)
-            logits = _suppress_eos(logits, args)
+            logits = _suppress_eos(logits, args, added < min_new)
             nxt = _sample(logits, args.temperature, args.top_k, args.top_p, args.min_p, args.greedy)
             ids = torch.cat([ids, nxt], 1)
             added += 1
@@ -4491,7 +4517,7 @@ def infer(args):
                 # Ban it here exactly like the NAT path does.
                 logits[..., BLANK] = -1e9
                 logits = _apply_penalties(logits, ids, args.penalty_last_n, args.repetition_penalty, args.presence_penalty, args.frequency_penalty)
-                logits = _suppress_eos(logits, args)
+                logits = _suppress_eos(logits, args, added < min_new)
                 nxt = _sample(logits, args.temperature, args.top_k, args.top_p, args.min_p, args.greedy)
                 new_tokens.append(nxt)
                 ids = torch.cat([ids, nxt], 1)
@@ -4675,9 +4701,24 @@ def _agillm43_prune_save_dir(save_dir):
             pass
 
 
-def _agillm43_convert_resume_delta(save_dir, log_path):
+def _agillm43_latest_checkpoint_path(save_dir):
     import glob
     import json
+    import os
+    from pathlib import Path
+    save = Path(save_dir)
+    src = ""
+    try:
+        src = json.loads((save / "latest.json").read_text()).get("path", "")
+    except Exception:
+        src = ""
+    if src and Path(src).exists():
+        return str(Path(src))
+    candidates = sorted(glob.glob(str(save / "pretrain_step*.pt")), key=os.path.getmtime)
+    return candidates[-1] if candidates else ""
+
+
+def _agillm43_convert_resume_delta(save_dir, log_path):
     import os
     import re
     from pathlib import Path
@@ -4688,14 +4729,7 @@ def _agillm43_convert_resume_delta(save_dir, log_path):
         shm = save
     out = shm / "agillm43_resume.delta.pt"
     mark = out.parent / ".agillm43_resume.step"
-    src = ""
-    try:
-        src = json.loads((save / "latest.json").read_text()).get("path", "")
-    except Exception:
-        src = ""
-    if not src or not Path(src).exists():
-        candidates = sorted(glob.glob(str(save / "pretrain_step*.pt")), key=os.path.getmtime)
-        src = candidates[-1] if candidates else ""
+    src = _agillm43_latest_checkpoint_path(save)
     if not src:
         seed = save / "agillm42_tiekv_seed.delta.pt"
         _agillm43_log_json(log_path, "native_supervisor_resume_seed", path=str(seed))
@@ -4730,28 +4764,59 @@ def _agillm43_convert_resume_delta(save_dir, log_path):
     return str(out)
 
 
-def _agillm43_train_argv(save_dir, side_dir, resume_delta):
+AGILLM43_PROFILE_CHOICES = ("normal", "sat_repair", "sat_probe")
+
+
+def _agillm43_profile_config(profile):
+    profile = str(profile or "normal").lower()
+    profiles = {
+        "normal": {
+            "ar_prob": "0.60", "sat_prob": "0.25", "nat_prob": "0.15",
+            "ar_loss_tokens": "512", "sat_loss_tokens": "512", "nat_loss_tokens": "512",
+            "sat_every": "1", "nat_every": "4",
+        },
+        "sat_repair": {
+            "ar_prob": "0.45", "sat_prob": "0.40", "nat_prob": "0.15",
+            "ar_loss_tokens": "512", "sat_loss_tokens": "1024", "nat_loss_tokens": "512",
+            "sat_every": "1", "nat_every": "4",
+        },
+        "sat_probe": {
+            "ar_prob": "0.05", "sat_prob": "0.90", "nat_prob": "0.05",
+            "ar_loss_tokens": "256", "sat_loss_tokens": "2048", "nat_loss_tokens": "256",
+            "sat_every": "1", "nat_every": "4",
+        },
+    }
+    if profile not in profiles:
+        raise ValueError(f"unknown AGILLM4.3 profile {profile!r}; choose one of {', '.join(AGILLM43_PROFILE_CHOICES)}")
+    cfg = profiles[profile].copy()
+    cfg["name"] = profile
+    return cfg
+
+
+def _agillm43_train_argv(save_dir, side_dir, resume_delta, profile="normal", warmstart_from=None):
     import sys
     from pathlib import Path
     script = str(Path(__file__).resolve())
     incoming = str(Path(side_dir) / "incoming")
     accepted = str(Path(side_dir) / "accepted")
     rejected = str(Path(side_dir) / "rejected")
+    prof = _agillm43_profile_config(profile)
     return [
         sys.executable, "-u", script, "train",
         "--preset", "agillm4_floor", "--tie_kv", "--resume_delta", resume_delta,
+        *(["--warmstart_from", str(warmstart_from)] if warmstart_from else []),
         "--dblock", "--dblock_blocks", "4", "--dblock_schedule", "loss_balanced",
         "--dblock_warmup_steps", "16", "--dblock_sigma_curriculum_steps", "2000",
         "--dblock_log_every", "25", "--dblock_objective_mode", "stochastic",
-        "--dblock_ar_prob", "0.45", "--dblock_sat_prob", "0.40", "--dblock_nat_prob", "0.15",
-        "--dblock_ar_loss_tokens", "512", "--dblock_sat_loss_tokens", "1024", "--dblock_nat_loss_tokens", "512",
+        "--dblock_ar_prob", prof["ar_prob"], "--dblock_sat_prob", prof["sat_prob"], "--dblock_nat_prob", prof["nat_prob"],
+        "--dblock_ar_loss_tokens", prof["ar_loss_tokens"], "--dblock_sat_loss_tokens", prof["sat_loss_tokens"], "--dblock_nat_loss_tokens", prof["nat_loss_tokens"],
         "--moe_ffn", "--moe_experts", "2", "--moe_top_k", "1", "--moe_mlp_mult", "4",
         "--moe_shared_experts", "1", "--moe_shared_mlp_mult", "2", "--moe_aux_coef", "0.01", "--moe_z_coef", "0.001",
         "--tie_weights", "--batch_size", "6", "--block", "1024", "--amp", "--attn_backend", "sublinear",
         "--sublinear_window", "128", "--sublinear_stride", "128", "--sublinear_max_anchors", "128", "--sublinear_chunk", "128",
         "--sublinear_sinks", "4", "--sublinear_recent_anchors", "64", "--no-sublinear_pooled_landmarks",
         "--grad_checkpoint", "--dblock_checkpoint_stride", "1", "--optimizer", "paged_adamw8bit",
-        "--loss_spike_skip", "3.0", "--sat_every", "1", "--nat_every", "4",
+        "--loss_spike_skip", "3.0", "--sat_every", prof["sat_every"], "--nat_every", prof["nat_every"],
         "--nat_max_tokens", "768", "--nat_mask_ratio", "0.5", "--token_param_ratio", "55",
         "--val_tokens", "32768", "--val_every_sec", "3600", "--data_seed", "-1",
         "--save_dir", str(save_dir), "--save_every_sec", "3600", "--heartbeat_every_sec", "300",
@@ -4760,7 +4825,6 @@ def _agillm43_train_argv(save_dir, side_dir, resume_delta):
         "--async_update_max_per_check", "2", "--async_update_max_age_sec", "86400",
         "--async_update_accepted_dir", accepted, "--async_update_rejected_dir", rejected,
     ]
-
 
 def _agillm43_dedupe_trainers(log_path, keep_pid=None):
     import signal
@@ -4789,7 +4853,9 @@ def supervise_agillm43(args):
     script_dir = Path(__file__).resolve().parent
     os.chdir(script_dir)
     env = _agillm43_prepare_env(save_dir, side_dir)
-    _agillm43_log_json(log_path, "native_supervisor_start", pid=os.getpid(), save_dir=str(save_dir), side_dir=str(side_dir))
+    profile = str(getattr(args, "profile", None) or os.environ.get("AGILLM43_PROFILE", "normal"))
+    _agillm43_profile_config(profile)
+    _agillm43_log_json(log_path, "native_supervisor_start", pid=os.getpid(), save_dir=str(save_dir), side_dir=str(side_dir), profile=profile)
     while True:
         while pause_file.exists():
             _agillm43_log_json(log_path, "native_supervisor_paused", pause=str(pause_file))
@@ -4804,9 +4870,10 @@ def supervise_agillm43(args):
             time.sleep(max(1, args.sleep_sec))
             continue
         _agillm43_prune_save_dir(save_dir)
+        resume_src = _agillm43_latest_checkpoint_path(save_dir)
         resume_delta = _agillm43_convert_resume_delta(save_dir, log_path)
-        argv = _agillm43_train_argv(save_dir, side_dir, resume_delta)
-        _agillm43_log_json(log_path, "native_supervisor_launch", argv=" ".join(argv))
+        argv = _agillm43_train_argv(save_dir, side_dir, resume_delta, profile=profile, warmstart_from=resume_src)
+        _agillm43_log_json(log_path, "native_supervisor_launch", profile=profile, warmstart_from=resume_src, argv=" ".join(argv))
         with open(log_path, "a", encoding="utf-8", buffering=1) as lf:
             child = subprocess.Popen(argv, cwd=str(script_dir), env=env, stdout=lf, stderr=subprocess.STDOUT)
         if args.once:
@@ -4877,6 +4944,7 @@ def hotpatch_agillm43(args):
             "python3", "-u", str(Path(__file__).resolve()), "supervise",
             "--save_dir", str(save_dir), "--side_dir", args.side_dir, "--log", log_path,
             "--pause_file", str(pause_file), "--sleep_sec", str(args.sleep_sec),
+            "--profile", str(args.profile),
         ]
         if args.tmux:
             import shlex
@@ -5118,6 +5186,7 @@ def main():
     inf.add_argument("--ckpt", required=True)
     inf.add_argument("--prompt", required=True)
     inf.add_argument("--max_new", type=int, default=120)
+    inf.add_argument("--min_new", type=int, default=0, help="Minimum generated tokens before EOS can stop decoding. SAT enforces at least one block.")
     inf.add_argument("--temperature", type=float, default=None)
     inf.add_argument("--greedy", action="store_true")
     inf.add_argument("--top_k", type=int, default=None)
@@ -5153,6 +5222,8 @@ def main():
     sup.add_argument("--sleep_sec", type=int, default=15)
     sup.add_argument("--dedupe", action=argparse.BooleanOptionalAction, default=True)
     sup.add_argument("--once", action="store_true")
+    sup.add_argument("--profile", choices=AGILLM43_PROFILE_CHOICES, default="normal",
+                     help="Training launch profile: normal, sat_repair, or sat_probe.")
     hp = sub.add_parser("hotpatch", help="Flush checkpoint and restart under native AGILLM4.3 supervisor")
     hp.add_argument("--save_dir", default="/workspace/agillm4_4090_ckpts")
     hp.add_argument("--side_dir", default="/workspace/agillm41_side_updates")
@@ -5161,6 +5232,8 @@ def main():
     hp.add_argument("--wait_flush_sec", type=int, default=900)
     hp.add_argument("--wait_start_sec", type=int, default=300)
     hp.add_argument("--sleep_sec", type=int, default=15)
+    hp.add_argument("--profile", choices=AGILLM43_PROFILE_CHOICES, default="normal",
+                    help="Training launch profile used by the restarted supervisor.")
     hp.add_argument("--force", action="store_true")
     hp.add_argument("--tmux", action=argparse.BooleanOptionalAction, default=True)
     hp.add_argument("--tmux_session", default="master_wd")
