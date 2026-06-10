@@ -8,4 +8,7 @@ start(){ tmux has-session -t "$1" 2>/dev/null && { echo "ok   $1 (already up)"; 
 start master_wd    /workspace/master_watchdog.sh
 start bucket_sync  /workspace/agillm41_bucket_sync_loop.sh
 start disk_janitor /workspace/janitor_watchdog.sh
+# HF checkpoint uploader: the off-box backup. Its absence made the PowerStep
+# divergence unrecoverable (no clean checkpoint anywhere). Never skip it.
+tmux has-session -t uploader 2>/dev/null && echo "ok   uploader (already up)" || { tmux new-session -d -s uploader "cd /workspace/agillm-4 && bash upload_agillm4_checkpoints_loop.sh" && echo "up   uploader"; }
 echo "--- sessions ---"; tmux ls 2>/dev/null
