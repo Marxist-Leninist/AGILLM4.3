@@ -81,7 +81,7 @@ exec python -u agillm41.py train --preset agillm4_floor --tie_kv $RESUME_ARG \
   --tie_weights --batch_size 6 --block 1024 --amp --attn_backend sublinear \
   --sublinear_window 128 --sublinear_stride 128 --sublinear_max_anchors 128 --sublinear_chunk 128 \
   --sublinear_sinks 4 --sublinear_recent_anchors 64 --no-sublinear_pooled_landmarks \
-  --grad_checkpoint --dblock_checkpoint_stride 1 --optimizer paged_adamw8bit --sat_every 4 --nat_every 4 \
+  --grad_checkpoint --dblock_checkpoint_stride 1 --optimizer powerstep --powerstep_int8 --lr_core 1e-4 --lr_head 1e-4 --loss_spike_skip 3.0 --sat_every 4 --nat_every 4 \
   --nat_max_tokens 768 --nat_mask_ratio 0.5 --token_param_ratio 55 \
   --val_tokens 32768 --val_every_sec 3600 --data_seed -1 \
   --save_dir "$SAVE_DIR" --save_every_sec 3600 --heartbeat_every_sec 300 \
