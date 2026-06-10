@@ -2291,7 +2291,8 @@ class TuneableAttentionMHA(nn.Module):
 
 
 class MoEFFN(nn.Module):
-    def __init__(self, d: int, mlp_mult: int = 4, experts: int = 4, top_k: int = 1):
+    def __init__(self, d: int, mlp_mult: int = 4, experts: int = 4, top_k: int = 1,
+                 shared_experts: int = 0, shared_mlp_mult: int = 0):
         super().__init__()
         self.d = int(d)
         self.mlp_mult = max(1, int(mlp_mult))
@@ -2303,9 +2304,33 @@ class MoEFFN(nn.Module):
             nn.Sequential(nn.Linear(self.d, hidden), nn.ReLU(), nn.Linear(hidden, self.d))
             for _ in range(self.num_experts)
         ])
+        # Shared experts (DeepSeek/ST-MoE style): always-on FFN added to the routed
+        # output, giving every token a consistent fallback representation -> lower
+        # routing variance, smoother optimization. Output layer is ZERO-INITIALISED so
+        # the shared path is a no-op at step 0, making it mergeable into an existing
+        # checkpoint without disruption (it then learns to contribute).
+        self.num_shared = max(0, int(shared_experts))
+        if self.num_shared > 0:
+            shidden = max(1, int(shared_mlp_mult) or self.mlp_mult) * self.d
+            self.shared = nn.ModuleList([
+                nn.Sequential(nn.Linear(self.d, shidden), nn.ReLU(), nn.Linear(shidden, self.d))
+                for _ in range(self.num_shared)
+            ])
+            for blk in self.shared:
+                nn.init.zeros_(blk[2].weight); nn.init.zeros_(blk[2].bias)
+        else:
+            self.shared = None
         # Detached FFN input stashed each training forward; the router aux loss is
         # recomputed OUTSIDE the gradient-checkpoint boundary by _collect_moe_aux().
         self.last_router_input = None
+
+    def _shared_out(self, flat):
+        if self.shared is None:
+            return 0.0
+        s = self.shared[0](flat)
+        for blk in self.shared[1:]:
+            s = s + blk(flat)
+        return s
 
     def forward(self, x):
         orig_shape = x.shape
@@ -2331,6 +2356,8 @@ class MoEFFN(nn.Module):
                 # sending a straight-through gradient into the top-1 router.
                 gate_st = (gate / gate.detach()).unsqueeze(-1)
                 out[mask] = expert(flat[mask]) * gate_st
+            if self.shared is not None:
+                out = out + self._shared_out(flat)
             return out.reshape(orig_shape)
 
         vals, idx = torch.topk(scores, k=self.top_k, dim=-1)
@@ -2344,6 +2371,8 @@ class MoEFFN(nn.Module):
                 if rows.numel() == 0:
                     continue
                 out.index_add_(0, rows, expert(flat.index_select(0, rows)) * weight.index_select(0, rows))
+        if self.shared is not None:
+            out = out + self._shared_out(flat)
         return out.reshape(orig_shape)
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
@@ -2425,6 +2454,8 @@ class Block(nn.Module):
         moe_experts: int = DEFAULT_MOE_EXPERTS,
         moe_top_k: int = DEFAULT_MOE_TOP_K,
         moe_mlp_mult: int = DEFAULT_MOE_MLP_MULT,
+        moe_shared_experts: int = 0,
+        moe_shared_mlp_mult: int = 0,
         tie_kv: bool = False,
     ):
         super().__init__()
@@ -2444,7 +2475,8 @@ class Block(nn.Module):
             tie_kv=tie_kv,
         )
         self.ff = (
-            MoEFFN(d, mlp_mult=moe_mlp_mult, experts=moe_experts, top_k=moe_top_k)
+            MoEFFN(d, mlp_mult=moe_mlp_mult, experts=moe_experts, top_k=moe_top_k,
+                   shared_experts=moe_shared_experts, shared_mlp_mult=moe_shared_mlp_mult)
             if moe_ffn else nn.Sequential(nn.Linear(d, 4 * d), nn.ReLU(), nn.Linear(4 * d, d))
         )
 
@@ -2481,6 +2513,8 @@ class Encoder(nn.Module):
         moe_experts: Optional[int] = None,
         moe_top_k: Optional[int] = None,
         moe_mlp_mult: Optional[int] = None,
+        moe_shared_experts: Optional[int] = None,
+        moe_shared_mlp_mult: Optional[int] = None,
         tie_kv: Optional[bool] = None,
     ):
         super().__init__()
@@ -2498,6 +2532,11 @@ class Encoder(nn.Module):
         moe_experts = max(1, int(moe_experts))
         moe_top_k = min(max(1, int(moe_top_k)), moe_experts)
         moe_mlp_mult = max(1, int(moe_mlp_mult))
+        if moe_shared_experts is None:
+            moe_shared_experts = int(cfg.get("moe_shared_experts", 0))
+        if moe_shared_mlp_mult is None:
+            moe_shared_mlp_mult = int(cfg.get("moe_shared_mlp_mult", 0))
+        moe_shared_experts = max(0, int(moe_shared_experts))
         self.emb = nn.Embedding(VOCAB, d)
         self.blocks = nn.ModuleList([
             Block(
@@ -2516,6 +2555,8 @@ class Encoder(nn.Module):
                 moe_experts=moe_experts,
                 moe_top_k=moe_top_k,
                 moe_mlp_mult=moe_mlp_mult,
+                moe_shared_experts=moe_shared_experts,
+                moe_shared_mlp_mult=moe_shared_mlp_mult,
                 tie_kv=bool(tie_kv),
             )
             for _ in range(l)
@@ -2535,6 +2576,7 @@ class Encoder(nn.Module):
         self.moe_experts = moe_experts
         self.moe_top_k = moe_top_k
         self.moe_mlp_mult = moe_mlp_mult
+        self.moe_shared_experts = moe_shared_experts
         self.anchor_memory_enabled = bool(anchor_memory)
         self.anchor_stride = int(anchor_stride)
         self.anchor_max = int(anchor_max)
@@ -3938,6 +3980,8 @@ def train(args):
         cfg["moe_experts"] = int(getattr(args, "moe_experts", DEFAULT_MOE_EXPERTS) if requested_moe else prev_moe.get("moe_experts", DEFAULT_MOE_EXPERTS))
         cfg["moe_top_k"] = int(getattr(args, "moe_top_k", DEFAULT_MOE_TOP_K) if requested_moe else prev_moe.get("moe_top_k", DEFAULT_MOE_TOP_K))
         cfg["moe_mlp_mult"] = int(getattr(args, "moe_mlp_mult", DEFAULT_MOE_MLP_MULT) if requested_moe else prev_moe.get("moe_mlp_mult", DEFAULT_MOE_MLP_MULT))
+        cfg["moe_shared_experts"] = int(getattr(args, "moe_shared_experts", 0) if requested_moe else prev_moe.get("moe_shared_experts", 0))
+        cfg["moe_shared_mlp_mult"] = int(getattr(args, "moe_shared_mlp_mult", 0) if requested_moe else prev_moe.get("moe_shared_mlp_mult", 0))
     else:
         cfg["moe_ffn"] = False
     use_nat_head = not bool(getattr(args, "no_nat_head", False))
@@ -4560,6 +4604,10 @@ def main():
                     help="Router top-k experts per token when --moe_ffn is enabled.")
     tr.add_argument("--moe_mlp_mult", type=int, default=DEFAULT_MOE_MLP_MULT,
                     help="Expert hidden-size multiplier; 4 preserves dense FFN checkpoint shape for seeding.")
+    tr.add_argument("--moe_shared_experts", type=int, default=0,
+                    help="Always-on shared experts added to the routed output (DeepSeek/ST-MoE style). 0 disables. Output is zero-init so it merges into an existing checkpoint as a no-op then learns to contribute.")
+    tr.add_argument("--moe_shared_mlp_mult", type=int, default=0,
+                    help="Hidden-size multiplier for shared experts (0 = same as --moe_mlp_mult). Use a smaller value (1-2) to limit added VRAM.")
     tr.add_argument("--moe_aux_coef", type=float, default=0.0,
                     help="Weight for the MoE load-balance (Switch) aux loss. 0 disables (legacy). ~0.01 keeps both experts utilised under top-1 routing. Checkpoint-safe (router recomputed outside the checkpoint).")
     tr.add_argument("--moe_z_coef", type=float, default=0.0,
