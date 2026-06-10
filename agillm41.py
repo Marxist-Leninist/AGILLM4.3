@@ -3035,6 +3035,65 @@ def _disk_hygiene(save_dir, phase_name: str, args, reason: str = ""):
     except Exception as e:
         print(f"[disk-hygiene] error: {e}", flush=True)
 
+def _build_val_set(source, chat_cfg, args, block):
+    """Capture a fixed held-out token sample (val_seed stream) as (1, block+1) CPU batches.
+    A fixed sample re-evaluated periodically gives a comparable loss curve over training."""
+    n = int(getattr(args, "val_tokens", 0) or 0)
+    if n <= 0:
+        return []
+    want = max(1, n // (block + 1)) * (block + 1)
+    toks = []
+    try:
+        for t in token_stream(
+            source, want, seed=int(getattr(args, "val_seed", 1337)),
+            chat=chat_cfg.get("chat", False),
+            chat_messages_key=chat_cfg.get("key", "messages"),
+            sft_add_generation_prompt=chat_cfg.get("gen_prompt", False),
+            dataset_field_text=chat_cfg.get("text_field", "text"),
+            streaming=True,
+        ):
+            toks.append(int(t))
+            if len(toks) >= want:
+                break
+    except Exception as e:
+        print(f"[val] failed to build val set ({type(e).__name__}: {e}); validation disabled", flush=True)
+        return []
+    batches = [torch.tensor(toks[i:i + block + 1], dtype=torch.long).unsqueeze(0)
+               for i in range(0, len(toks) - block, block + 1)]
+    print(f"[val] held-out set ready: {len(batches)} batches x {block + 1} tokens (seed {getattr(args, 'val_seed', 1337)})", flush=True)
+    return batches
+
+
+def _run_validation(core, ar_h, val_batches, args, step):
+    """Full-stack AR cross-entropy on the fixed held-out batches (no_grad, eval mode)."""
+    if not val_batches:
+        return None
+    was_training = core.training
+    core.eval(); ar_h.eval()
+    tot_ce, tot_tok = 0.0, 0
+    try:
+        with torch.no_grad():
+            for ids_cpu in val_batches:
+                ids = ids_cpu.to(DEV)
+                with amp(args.amp):
+                    h = core(ids, causal_mask(ids.size(1), structured=use_structured_masks(args)))
+                    ce = fused_ce(h[:, :-1], ar_h.proj.weight, ids[:, 1:])
+                ntok = ids.size(1) - 1
+                tot_ce += float(ce.detach()) * ntok
+                tot_tok += ntok
+    except Exception as e:
+        print(f"[val] eval error ({type(e).__name__}: {e}); skipping this round", flush=True)
+        if was_training:
+            core.train(); ar_h.train()
+        return None
+    if was_training:
+        core.train(); ar_h.train()
+    ce = tot_ce / max(1, tot_tok)
+    ppl = math.exp(min(20.0, ce))
+    print(f"[val] step={step} tokens={tot_tok} ce={ce:.4f} ppl={ppl:.2f}", flush=True)
+    return ce
+
+
 def _load_module_state_compatible(module: nn.Module, state: dict, label: str = "module") -> int:
     """Load matching tensors only; skip obsolete untied vocab matrices for tied heads."""
     if not isinstance(state, dict):
@@ -3443,8 +3502,17 @@ def _train_phase(
         if total_tokens_needed <= seen_tok:
             print(f"[{phase_name}] target {total_tokens_needed} already reached.")
             return start_step, seen_tok, resume_wall_time
+    data_seed = int(getattr(args, "data_seed", 42))
+    if data_seed < 0:
+        # Streaming restarts from the dataset head with a fixed shuffle seed, so every
+        # restart re-trains the same early data. Derive a per-resume seed instead:
+        # deterministic for a given checkpoint, different across restarts.
+        data_seed = 42 + int(start_step)
+        print(f"[data] per-restart shuffle seed {data_seed} (derived from resume step)", flush=True)
+    val_batches = _build_val_set(source, chat_cfg, args, BLOCK)
+    last_val_mono = time.monotonic()
     stream = token_stream(
-        source, total_tokens_needed, seed=42,
+        source, total_tokens_needed, seed=data_seed,
         chat=chat_cfg.get("chat", False),
         chat_messages_key=chat_cfg.get("key", "messages"),
         sft_add_generation_prompt=chat_cfg.get("gen_prompt", False),
@@ -3467,6 +3535,8 @@ def _train_phase(
     last_delta_step = start_step
     last_heartbeat_mono = time.monotonic()
     _disk_hygiene(pathlib.Path(args.save_dir), phase_name, args, reason="startup")
+    if val_batches:
+        _run_validation(core, ar_h, val_batches, args, step)
     print(f"[{phase_name}] Starting. Goal: {total_tokens_needed:,} tokens. Batch={BATCH}, Block={BLOCK}")
     print(
         f"[{phase_name}] AR_ONLY={args.ar_only}, SAT_EVERY={args.sat_every}, "
@@ -3670,6 +3740,10 @@ def _train_phase(
                 flush=True,
             )
             last_heartbeat_mono = now_mono
+        if val_batches and int(getattr(args, "val_every_sec", 0) or 0) > 0 and \
+                (time.monotonic() - last_val_mono) >= int(args.val_every_sec):
+            _run_validation(core, ar_h, val_batches, args, step)
+            last_val_mono = time.monotonic()
         _flush_sentinel = pathlib.Path(args.save_dir) / "FLUSH_NOW"
         if _flush_flag[0] or _flush_sentinel.exists():
             _flush_flag[0] = False
@@ -4315,6 +4389,14 @@ def main():
     tr.add_argument("--save_every_sec", type=int, default=DEFAULT_SAVE_SEC)
     tr.add_argument("--disk_free_floor_gb", type=float, default=12.0,
                     help="In-file disk auto-prune: when free space drops below this, escalate pruning of transient artifacts and old checkpoints. 0 disables the floor (routine keep-count pruning still runs).")
+    tr.add_argument("--val_tokens", type=int, default=0,
+                    help="Held-out validation set size in tokens (sampled once from --val_seed stream at startup). 0 disables validation.")
+    tr.add_argument("--val_every_sec", type=int, default=3600,
+                    help="Run held-out validation every N seconds (requires --val_tokens > 0).")
+    tr.add_argument("--val_seed", type=int, default=1337,
+                    help="Shuffle seed for the held-out validation stream (distinct from the training data seed).")
+    tr.add_argument("--data_seed", type=int, default=42,
+                    help="Training stream shuffle seed. -1 derives a per-restart seed from the resume step so restarts do not re-train identical early data.")
     tr.add_argument("--heartbeat_every_sec", type=int, default=300,
                     help="Print lightweight trainer heartbeat/status lines every N seconds; 0 disables.")
     tr.add_argument("--empty_cache_every_steps", type=int, default=0,
