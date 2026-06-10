@@ -100,7 +100,7 @@ def resolve_device(name: str) -> torch.device:
 
 
 def block_kwargs(runtime: Any, cfg: dict[str, Any], rargs: dict[str, Any]) -> dict[str, Any]:
-    return {
+    kw = {
         "attn_backend": rargs.get("attn_backend", "manual"),
         "sublinear_window": int(rargs.get("sublinear_window", getattr(runtime, "DEFAULT_SUBLINEAR_WINDOW", 128))),
         "sublinear_stride": int(rargs.get("sublinear_stride", getattr(runtime, "DEFAULT_SUBLINEAR_STRIDE", 128))),
@@ -114,6 +114,13 @@ def block_kwargs(runtime: Any, cfg: dict[str, Any], rargs: dict[str, Any]) -> di
         "moe_top_k": int(cfg.get("moe_top_k", getattr(runtime, "DEFAULT_MOE_TOP_K", 1))),
         "moe_mlp_mult": int(cfg.get("moe_mlp_mult", getattr(runtime, "DEFAULT_MOE_MLP_MULT", 4))),
     }
+    # Shared experts (AGILLM 4.3+): forward only when the runtime's Block accepts
+    # them, so packages built from older runtime files keep working unchanged.
+    import inspect
+    if "moe_shared_experts" in inspect.signature(runtime.Block.__init__).parameters:
+        kw["moe_shared_experts"] = int(cfg.get("moe_shared_experts", 0))
+        kw["moe_shared_mlp_mult"] = int(cfg.get("moe_shared_mlp_mult", 0))
+    return kw
 
 
 class SliceCore(nn.Module):

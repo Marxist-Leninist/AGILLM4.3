@@ -12,3 +12,7 @@ start disk_janitor /workspace/janitor_watchdog.sh
 # divergence unrecoverable (no clean checkpoint anywhere). Never skip it.
 tmux has-session -t uploader 2>/dev/null && echo "ok   uploader (already up)" || { tmux new-session -d -s uploader "cd /workspace/agillm-4 && bash upload_agillm4_checkpoints_loop.sh" && echo "up   uploader"; }
 echo "--- sessions ---"; tmux ls 2>/dev/null
+# Federation: hourly side-round publisher (4 Hetzner CPU nodes train assigned
+# DiffusionBlocks) + puller that lands their updates in the trainer's async-merge dir.
+start side_cycle  /workspace/side_cycle_watchdog.sh
+start side_puller /workspace/agillm41_vast_side_update_puller.sh
