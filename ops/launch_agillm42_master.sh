@@ -7,6 +7,11 @@ export TOKENIZERS_PARALLELISM=false
 export TOKENIZER_ID=deepseek-ai/DeepSeek-V4-Pro
 export AGILLM_ATTN_BACKEND=sublinear
 unset PYTORCH_CUDA_ALLOC_CONF
+# Use the RAM disk (/dev/shm, tmpfs) for Python temp so imports never fail when the
+# 64GB overlay is full -- 'No usable temporary directory' is what crash-looped us.
+if [ -d /dev/shm ] && [ -w /dev/shm ]; then
+  mkdir -p /dev/shm/agillm_tmp && export TMPDIR=/dev/shm/agillm_tmp TMP=/dev/shm/agillm_tmp TEMP=/dev/shm/agillm_tmp
+fi
 if [ -f /root/.cache/huggingface/token ]; then
   HF_TOKEN="$(tr -d '\r\n' </root/.cache/huggingface/token)"; export HF_TOKEN HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
 fi
@@ -16,8 +21,8 @@ mkdir -p "$SAVE_DIR" "$SIDE_DIR/incoming" "$SIDE_DIR/accepted" "$SIDE_DIR/reject
 exec >> /workspace/agillm41_master_train.log 2>&1
 echo "LAUNCH_AGILLM42_MASTER (tie_kv) $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 SEED_DELTA="$SAVE_DIR/agillm42_tiekv_seed.delta.pt"
-RESUME_DELTA="$SAVE_DIR/agillm42_resume.delta.pt"
-RESUME_MARK="$SAVE_DIR/.agillm42_resume.step"
+RESUME_DELTA="${SHM_DIR:-/dev/shm}/agillm42_resume.delta.pt"; [ -d /dev/shm ] && [ -w /dev/shm ] || RESUME_DELTA="$SAVE_DIR/agillm42_resume.delta.pt"
+RESUME_MARK="$(dirname "$RESUME_DELTA")/.agillm42_resume.step"
 # Disk hygiene: clear partial saves left by a crashed/OOM-killed write so they
 # cannot accumulate and wedge the disk (a full disk -> "No usable temporary
 # directory" -> watchdog crash-loop). Keep only the newest 2 full checkpoints.
