@@ -17,7 +17,7 @@ AGILLM 4.3 is the AGILLM 4.2 warm start with shared MoE experts and DiffusionBlo
 
 This public repo is for inspection, local inference experiments, and untrusted volunteer helpers. It intentionally excludes trusted-core operations, private topology, watchdog launch scripts, live hot configs, SSH paths, API tokens, and checkpoint merge scripts.
 
-Untrusted volunteer nodes should use only the outbound public join flow:
+Untrusted volunteer nodes should use only the outbound public join flow. The published coordinator is `https://join.opentransformers.online`, and its health endpoint is `https://join.opentransformers.online/health`.
 
 ```bash
 python public_join/agillm41_join_worker.py \

@@ -5,23 +5,19 @@ This folder has two public network modes:
 - join Scott's AGILLM4.3 network as an untrusted outbound-only helper;
 - start your own signed-lease network for your own AGILLM4.3 run.
 
-The public repository intentionally does **not** contain Scott's live
-coordinator URL, join code, private SSH details, checkpoint paths, or validator
-policy. Scott has to publish the public URL, and optionally a join code, in a
-pinned issue, Discord post, web page, or direct message.
+The public coordinator for Scott's network is published here. Private SSH
+routes, backend hostnames, checkpoint paths, merge scripts, validator policy,
+and secrets still stay out of the public repo.
 
 ## Join Scott's Network
 
-You need Scott's public coordinator URL. Scott may also publish a join code, but
-the join code is optional. It is an abuse-control gate, not the security model.
+Published coordinator:
 
-- `AGILLM41_COORDINATOR_URL`: the public HTTPS endpoint, for example
-  `https://join.opentransformers.online`.
-- `AGILLM41_JOIN_CODE`: optional. Use it only if Scott says the current
-  coordinator requires one.
+- `AGILLM41_COORDINATOR_URL`: `https://join.opentransformers.online`
+- Health check: `https://join.opentransformers.online/health`
+- `AGILLM41_JOIN_CODE`: optional. Current public mode does not require one; use it only if Scott says the coordinator is gated.
 
-Do not guess the coordinator URL. A random domain in this README is only an
-example.
+The join code is an abuse-control gate, not the security model. The real trust boundary is outbound-only workers, short-lived leases, SHA-256 artifact checks, quarantine, and trusted validation before merge.
 
 ### What A Helper Runs
 
@@ -94,15 +90,14 @@ The coordinator decides whether a quarantined result is accepted. Public helper
 updates must never be merged into `master.pt` or a live checkpoint without a
 separate validator.
 
-### What Scott Must Publish
-
-For people to actually join Scott's network, Scott needs to publish:
+### Published Join Details
 
 ```text
-Coordinator URL: https://join.<scotts-domain>
+Coordinator URL: https://join.opentransformers.online
+Health: https://join.opentransformers.online/health
 Join code: optional; only needed if the coordinator is running in gated mode
 Recommended command:
-  python public_join/agillm41_join_worker.py --coordinator-url ... --device cpu --threads 2 --loop
+  python public_join/agillm41_join_worker.py --coordinator-url https://join.opentransformers.online --device cpu --threads 2 --loop
 ```
 
 Everything else stays private: SSH keys, Vast/Hetzner hostnames, checkpoint
