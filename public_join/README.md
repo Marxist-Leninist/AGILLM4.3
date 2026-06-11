@@ -90,6 +90,28 @@ The coordinator decides whether a quarantined result is accepted. Public helper
 updates must never be merged into `master.pt` or a live checkpoint without a
 separate validator.
 
+
+### Operator Promotion Into A Trusted Trainer
+
+Validation and promotion are intentionally separate steps. The validator only
+moves metadata to `accepted/` after checking an untrusted upload with
+`torch.load(..., weights_only=True)`, finite tensors, size limits, and norm
+limits. To let a trusted trainer ingest one accepted public result, an operator
+can then run:
+
+```bash
+python public_join/agillm41_promote_accepted.py \
+  --spool /root/agillm41_public_join/spool \
+  --out-dir /root/agillm41_worker/updates \
+  --lease-id <accepted-lease-id>
+```
+
+The promoter re-checks the result SHA-256, loads with `weights_only=True`,
+normalizes the wrapper kind to `agillm41_dblock_slice_update`, preserves public
+join audit metadata inside the update, and writes the `.pt` atomically. Do not
+run promotion as a blind loop for untrusted volunteers; keep validation policy,
+rate limits, and merge cadence under trusted operator control.
+
 ### Published Join Details
 
 ```text

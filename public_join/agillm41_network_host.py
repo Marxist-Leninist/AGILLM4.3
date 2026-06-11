@@ -235,15 +235,21 @@ class LeaseStore:
             candidates = sorted((self.spool / "available").glob("*.json"))
             if not candidates:
                 return None
-            # device-aware: GPU workers -> gpu-tier lease, CPU -> cpu-tier
+            # Device-aware and cheap-first: GPU workers prefer gpu-tier leases;
+            # CPU/unknown workers prefer the smallest cpu-tier lease so public
+            # volunteers do not accidentally pull a large GPU package.
             _dev = (capabilities.get("device") or (capabilities.get("machine") or {}).get("best_device") or "cpu")
-            _want = "gpu" if str(_dev) in ("cuda", "directml") else "cpu"
-            src = candidates[0]
+            _want = "gpu" if str(_dev).lower() in ("cuda", "directml", "gpu") else "cpu"
+            ranked = []
             for _c in candidates:
-                if ((read_json(_c, {}).get("metadata") or {}).get("tier")) == _want:
-                    src = _c
-                    break
-            lease = read_json(src, {})
+                _lease = read_json(_c, {})
+                _tier = ((_lease.get("metadata") or {}).get("tier") or "cpu")
+                _size = int((_lease.get("package") or {}).get("bytes") or 0)
+                _match = 0 if _tier == _want else 1
+                ranked.append((_match, _size, _c.name, _c, _lease))
+            ranked.sort()
+            src = ranked[0][3]
+            lease = ranked[0][4]
             lease_id = secrets.token_urlsafe(18)
             expires_at = utc() + int(lease.get("ttl_sec", 900))
             lease.update(

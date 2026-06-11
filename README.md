@@ -33,6 +33,7 @@ The worker opens outbound HTTPS only, verifies SHA-256 for lease artifacts, rece
 
 - `agillm41.py`: latest public AGILLM runtime, including AR/SAT/NAT inference and DiffusionBlocks paths.
 - `public_join/`: outbound worker, public lease coordinator, and public validation/points helpers.
+- `agillm4/training_bench/agillm4_slice_bench_worker.py`: default public slice worker for leased training packages.
 - `distributed_infer/`: public distributed inference harnesses without private launch topology.
 
 ## Private Counterpart

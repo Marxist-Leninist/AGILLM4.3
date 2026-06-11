@@ -23,6 +23,7 @@ from urllib.request import Request, urlopen
 
 
 VERSION = "2026-06-02"
+USER_AGENT = "AGILLM43JoinWorker/2026.06"
 
 
 def sha256_file(path: Path) -> str:
@@ -41,7 +42,7 @@ def ssl_context(insecure: bool) -> ssl.SSLContext | None:
 
 def http_json(url: str, payload: dict[str, Any], insecure: bool) -> tuple[int, dict[str, Any] | None]:
     body = json.dumps(payload).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json", "User-Agent": USER_AGENT}
     if payload.get("join_code"):
         headers["X-Join-Code"] = str(payload["join_code"])
     req = Request(url, data=body, method="POST", headers=headers)
@@ -56,7 +57,9 @@ def http_json(url: str, payload: dict[str, Any], insecure: bool) -> tuple[int, d
 
 def download(url: str, dest: Path, expected_sha: str, token: str, insecure: bool) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    headers = {"User-Agent": USER_AGENT}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     req = Request(url, headers=headers)
     tmp = dest.with_suffix(dest.suffix + ".part")
     h = hashlib.sha256()
@@ -84,6 +87,7 @@ def submit_file(url: str, path: Path, token: str, insecure: bool) -> dict[str, A
     conn = conn_cls(parsed.hostname, parsed.port, **kwargs)
     target = parsed.path + (("?" + parsed.query) if parsed.query else "")
     conn.putrequest("POST", target)
+    conn.putheader("User-Agent", USER_AGENT)
     conn.putheader("Authorization", f"Bearer {token}")
     conn.putheader("Content-Type", "application/octet-stream")
     conn.putheader("Content-Length", str(path.stat().st_size))
@@ -110,7 +114,7 @@ def cache_artifact(lease: dict[str, Any], key: str, cache_dir: Path, token: str,
     # Primary = Cloudflare-fronted dl. subdomain (lease token); fall back to the
     # public Hugging Face mirror (no token) so a CF/origin hiccup can't strand a
     # volunteer. sha256 is verified either way, so a bad mirror just retries.
-    attempts = [(spec["url"], token)]
+    attempts = [(spec["url"], token), (spec["url"], "")]
     if spec.get("mirror_url"):
         attempts.append((spec["mirror_url"], ""))
     last_err = None
