@@ -15,3 +15,4 @@ ckpts*/
 .git-credentials
 hf_token*
 secrets/
+!training/agillm43_shared/checkpoints/full/*.pt

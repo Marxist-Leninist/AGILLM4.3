@@ -1872,9 +1872,24 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
         weights = [1.0] * len(sources)
     _rng = random.Random(seed)
     its = [None] * len(sources)
-    src_idx = 0; emitted = 0; attempts = 0; backoff_base = 2.0
+    emitted = 0
+    fail_counts = [0] * len(sources)
+    disabled_until = [0.0] * len(sources)
+    last_retry_log = [0.0] * len(sources)
+    backoff_base = 2.0
+    max_cooldown = float(os.environ.get("AGILLM_STREAM_SOURCE_MAX_COOLDOWN_SEC", "300") or 300)
+    fatal_cooldown = float(os.environ.get("AGILLM_STREAM_SOURCE_FATAL_COOLDOWN_SEC", "1800") or 1800)
+    fatal_errors = {"DataFilesNotFoundError", "ArrowInvalid", "CastError", "FileNotFoundError"}
     while emitted < target:
-        src_idx = _rng.choices(range(len(sources)), weights=weights)[0]
+        now = time.time()
+        available = [i for i, w in enumerate(weights) if w > 0.0 and disabled_until[i] <= now]
+        if not available:
+            next_ready = min(disabled_until) if disabled_until else now + 1.0
+            sleep_s = max(1.0, min(30.0, next_ready - now))
+            print(f"[stream-retry] all sources cooling down, sleeping {sleep_s:.1f}s", flush=True)
+            time.sleep(sleep_s)
+            continue
+        src_idx = _rng.choices(available, weights=[weights[i] for i in available])[0]
         try:
             if its[src_idx] is None:
                 its[src_idx] = _open_stream_one(sources[src_idx], seed + src_idx, streaming=streaming)
@@ -1889,7 +1904,11 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
                     elif isinstance(ex.get("text"), str):
                         text = ex["text"]
             if not isinstance(text, str):
-                attempts = 0; continue
+                continue
+            if fail_counts[src_idx]:
+                print(f"[stream-recover] {sources[src_idx]} recovered after {fail_counts[src_idx]} failures", flush=True)
+                fail_counts[src_idx] = 0
+                disabled_until[src_idx] = 0.0
             enc = tok.encode(text)
             if EOS is not None and (len(enc) == 0 or enc[-1] != EOS):
                 enc = enc + [EOS]
@@ -1897,14 +1916,23 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
                 yield t
                 emitted += 1
                 if emitted >= target: return
-            attempts = 0
         except StopIteration:
             its[src_idx] = None  # exhausted: reopen on next pick (stream cycles)
         except Exception as e:
-            attempts += 1
-            sleep_s = min(60.0, backoff_base ** min(attempts, 6))
-            print(f"[stream-retry] {sources[src_idx]} error: {type(e).__name__}, sleeping {sleep_s:.1f}s")
-            time.sleep(sleep_s); its[src_idx] = None
+            its[src_idx] = None
+            fail_counts[src_idx] += 1
+            err = type(e).__name__
+            cooldown = min(max_cooldown, backoff_base ** min(fail_counts[src_idx], 8))
+            if err in fatal_errors:
+                cooldown = max(cooldown, fatal_cooldown)
+            disabled_until[src_idx] = time.time() + cooldown
+            if time.time() - last_retry_log[src_idx] > 15.0 or fail_counts[src_idx] <= 2:
+                print(
+                    f"[stream-retry] {sources[src_idx]} error: {err}, "
+                    f"cooling {cooldown:.1f}s failures={fail_counts[src_idx]}",
+                    flush=True,
+                )
+                last_retry_log[src_idx] = time.time()
 
 # ───────────────────────── ALiBi ─────────────────────────
 def _alibi_slopes(n_heads: int):

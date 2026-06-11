@@ -1,3 +1,4 @@
 agillm4/**/*.py text eol=lf
 agillm4/**/*.sh text eol=lf
 agillm4/**/*.md text eol=lf
+training/agillm43_shared/checkpoints/full/*.pt filter=lfs diff=lfs merge=lfs -text
