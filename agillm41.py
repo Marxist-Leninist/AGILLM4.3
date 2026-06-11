@@ -1850,8 +1850,9 @@ def _open_stream_one(ds_name: str, seed: int, streaming: bool = True):
 def token_stream(ds_names: str, target: int, seed: int = 42,
                  chat: bool = False, chat_messages_key: str = "messages",
                  sft_add_generation_prompt: bool = False, dataset_field_text: str = "text",
-                 streaming: bool = True):
-    ds_names = get_hot_datasets(ds_names)  # HOT LOAD
+                 streaming: bool = True, use_hot_config: bool = True):
+    if use_hot_config:
+        ds_names = get_hot_datasets(ds_names)  # HOT LOAD
     raw = [s.strip() for s in ds_names.split(",") if s.strip()]
     if not raw: return
     # Weighted interleave across sources ("ref|weight", default 1.0). The old loop
@@ -3139,15 +3140,24 @@ def _build_val_set(source, chat_cfg, args, block):
     if n <= 0:
         return []
     want = max(1, n // (block + 1)) * (block + 1)
+    val_source = str(getattr(args, "val_source", "") or "").strip()
+    use_hot_config = not bool(val_source)
+    val_source = val_source or source
+    print(
+        f"[val] building held-out set from {val_source} "
+        f"(hot_config={'on' if use_hot_config else 'off'}, seed {getattr(args, 'val_seed', 1337)})",
+        flush=True,
+    )
     toks = []
     try:
         for t in token_stream(
-            source, want, seed=int(getattr(args, "val_seed", 1337)),
+            val_source, want, seed=int(getattr(args, "val_seed", 1337)),
             chat=chat_cfg.get("chat", False),
             chat_messages_key=chat_cfg.get("key", "messages"),
             sft_add_generation_prompt=chat_cfg.get("gen_prompt", False),
             dataset_field_text=chat_cfg.get("text_field", "text"),
             streaming=True,
+            use_hot_config=use_hot_config,
         ):
             toks.append(int(t))
             if len(toks) >= want:
@@ -4734,33 +4744,60 @@ def _agillm43_convert_resume_delta(save_dir, log_path):
         seed = save / "agillm42_tiekv_seed.delta.pt"
         _agillm43_log_json(log_path, "native_supervisor_resume_seed", path=str(seed))
         return str(seed)
-    m = re.search(r"step0*([0-9]+)", Path(src).name)
+    src_path = Path(src)
+    m = re.search(r"step0*([0-9]+)", src_path.name)
     fstep = m.group(1) if m else ""
-    if fstep and out.exists() and mark.exists():
+    try:
+        st = src_path.stat()
+        src_meta = {
+            "path": str(src_path.resolve()),
+            "name": src_path.name,
+            "size": int(st.st_size),
+            "mtime_ns": int(st.st_mtime_ns),
+            "step": int(fstep) if fstep else None,
+        }
+    except Exception:
+        src_meta = {
+            "path": str(src_path),
+            "name": src_path.name,
+            "step": int(fstep) if fstep else None,
+        }
+
+    def _resume_delta_mark_matches():
+        if not (out.exists() and mark.exists()):
+            return False
         try:
-            if mark.read_text().strip() == fstep:
-                _agillm43_log_json(log_path, "native_supervisor_resume_delta_current", step=int(fstep), path=str(out))
-                return str(out)
+            payload = json.loads(mark.read_text().strip() or "{}")
         except Exception:
-            pass
-    ck = torch.load(src, map_location="cpu", weights_only=False)
+            # Old marker files only stored the step number. Rebuild once so a
+            # stale delta from a failed probe cannot replay over a good full ckpt.
+            return False
+        if not isinstance(payload, dict):
+            return False
+        return all(payload.get(k) == v for k, v in src_meta.items())
+
+    if _resume_delta_mark_matches():
+        _agillm43_log_json(log_path, "native_supervisor_resume_delta_current", source=src_meta, path=str(out))
+        return str(out)
+
+    ck = torch.load(src_path, map_location="cpu", weights_only=False)
     delta = {
         "delta": True,
         "weights": {k: ck[k] for k in ("core", "ar", "sat", "nat") if k in ck},
         "step": ck.get("step", 0),
         "seen_tok": ck.get("seen_tok", 0),
         "cfg": ck.get("cfg"),
+        "source_checkpoint": src_meta,
     }
     tmp = str(out) + ".tmp"
     torch.save(delta, tmp)
     os.replace(tmp, out)
-    if fstep:
-        mark.write_text(fstep)
+    mark.write_text(json.dumps(src_meta, sort_keys=True))
     try:
         Path(str(out) + ".sha256").unlink()
     except FileNotFoundError:
         pass
-    _agillm43_log_json(log_path, "native_supervisor_resume_delta_converted", src=str(src), path=str(out), step=int(delta.get("step", 0)))
+    _agillm43_log_json(log_path, "native_supervisor_resume_delta_converted", src=str(src_path), source=src_meta, path=str(out), step=int(delta.get("step", 0)))
     return str(out)
 
 
@@ -4818,7 +4855,7 @@ def _agillm43_train_argv(save_dir, side_dir, resume_delta, profile="normal", war
         "--grad_checkpoint", "--dblock_checkpoint_stride", "1", "--optimizer", "paged_adamw8bit",
         "--loss_spike_skip", "3.0", "--sat_every", prof["sat_every"], "--nat_every", prof["nat_every"],
         "--nat_max_tokens", "768", "--nat_mask_ratio", "0.5", "--token_param_ratio", "55",
-        "--val_tokens", "32768", "--val_every_sec", "3600", "--data_seed", "-1",
+        "--val_tokens", "32768", "--val_every_sec", "3600", "--val_source", "json:/workspace/agillm_math_numeracy_synth/train.jsonl", "--data_seed", "-1",
         "--save_dir", str(save_dir), "--save_every_sec", "3600", "--heartbeat_every_sec", "300",
         "--empty_cache_every_steps", "0", "--delta_every_steps", "25000", "--delta_max_keep", "1", "--max_ckpts", "2",
         "--async_update_dir", incoming, "--async_update_every_steps", "100", "--async_update_alpha", "0.05",
@@ -5042,6 +5079,8 @@ def main():
                     help="Run held-out validation every N seconds (requires --val_tokens > 0).")
     tr.add_argument("--val_seed", type=int, default=1337,
                     help="Shuffle seed for the held-out validation stream (distinct from the training data seed).")
+    tr.add_argument("--val_source", default="",
+                    help="Optional validation-only dataset source. When set, bypasses hot_config so health probes are comparable across restarts.")
     tr.add_argument("--data_seed", type=int, default=42,
                     help="Training stream shuffle seed. -1 derives a per-restart seed from the resume step so restarts do not re-train identical early data.")
     tr.add_argument("--heartbeat_every_sec", type=int, default=300,

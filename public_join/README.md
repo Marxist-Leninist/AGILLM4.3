@@ -1,9 +1,9 @@
-# AGILLM4.1 Public Join Layer
+# AGILLM4.3 Public Join Layer
 
 This folder has two public network modes:
 
-- join Scott's AGILLM4.1 network as an untrusted outbound-only helper;
-- start your own signed-lease network for your own AGILLM4.1 run.
+- join Scott's AGILLM4.3 network as an untrusted outbound-only helper;
+- start your own signed-lease network for your own AGILLM4.3 run.
 
 The public repository intentionally does **not** contain Scott's live
 coordinator URL, join code, private SSH details, checkpoint paths, or validator
@@ -30,8 +30,8 @@ By default the worker runs `--device auto`: it detects CUDA, then DirectML, else
 Linux/macOS:
 
 ```bash
-git clone https://github.com/Marxist-Leninist/AGILLM4.1.git
-cd AGILLM4.1
+git clone https://github.com/Marxist-Leninist/AGILLM4.3.git
+cd AGILLM4.3
 python -m venv .venv
 . .venv/bin/activate
 python -m pip install --upgrade pip torch
@@ -56,8 +56,8 @@ and pass `--join-code "$AGILLM41_JOIN_CODE"`.
 Windows PowerShell:
 
 ```powershell
-git clone https://github.com/Marxist-Leninist/AGILLM4.1.git
-cd AGILLM4.1
+git clone https://github.com/Marxist-Leninist/AGILLM4.3.git
+cd AGILLM4.3
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip torch
@@ -168,7 +168,7 @@ python public_join/agillm41_network_host.py serve \
 talks to the coordinator over local loopback only. Do not bind public HTTP to
 the internet.
 
-Add an AGILLM4.1 side-worker lease:
+Add an AGILLM4.3 side-worker lease:
 
 ```bash
 python public_join/agillm41_network_host.py add-lease \

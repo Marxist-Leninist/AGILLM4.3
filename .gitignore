@@ -2,5 +2,16 @@ __pycache__/
 *.pyc
 ckpts*/
 *.pt
+*.safetensors
+*.bin
 *.tmp
+*.log
+*.pid
 .env
+.env*
+*.key
+*.pem
+.netrc
+.git-credentials
+hf_token*
+secrets/

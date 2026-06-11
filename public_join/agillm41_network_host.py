@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Single-file AGILLM4.1 lease coordinator for trusted or untrusted helpers.
+"""Single-file AGILLM4.3 lease coordinator for trusted or untrusted helpers.
 
 The server exposes HTTPS lease/request and result/submit endpoints. It never
 exposes coordinator SSH. Results from public helpers are written to quarantine;
@@ -615,7 +615,7 @@ def list_spool(args: argparse.Namespace) -> None:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="AGILLM4.1 single-file lease coordinator")
+    ap = argparse.ArgumentParser(description="AGILLM4.3 single-file lease coordinator")
     sub = ap.add_subparsers(dest="cmd", required=True)
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--spool", default=os.environ.get("AGILLM41_LEASE_SPOOL") or os.environ.get("AGILLM35_LEASE_SPOOL", "./agillm41_lease_spool"))

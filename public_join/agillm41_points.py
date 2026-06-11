@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AGILLM4.1 contribution points ledger (file-locked JSON).
+"""AGILLM4.3 contribution points ledger (file-locked JSON).
 
 Earn points by submitting validated training updates; spend points on
 distributed inference of the latest model. Identity is a self-generated

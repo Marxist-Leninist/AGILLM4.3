@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Single-file outbound AGILLM4.1 join worker.
+"""Single-file outbound AGILLM4.3 join worker.
 
 The client only opens outbound HTTPS connections, verifies package hashes, runs
 a local worker command, and submits the result with a short-lived lease token.
@@ -128,7 +128,7 @@ def default_worker_cmd(args: argparse.Namespace, lease: dict[str, Any], package:
     if not args.worker_script:
         raise RuntimeError("default mode requires --worker-script or --worker-cmd")
     if frozen is None:
-        raise RuntimeError("default AGILLM4.1 slice worker requires a shared/frozen artifact")
+        raise RuntimeError("default AGILLM4.3 slice worker requires a shared/frozen artifact")
     repo_root = Path(__file__).resolve().parents[1]
     worker_script = Path(args.worker_script)
     if not worker_script.is_absolute() and not worker_script.exists() and (repo_root / worker_script).exists():
@@ -239,7 +239,7 @@ def once(args: argparse.Namespace) -> bool:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="AGILLM4.1 outbound-only untrusted join worker")
+    ap = argparse.ArgumentParser(description="AGILLM4.3 outbound-only untrusted join worker")
     ap.add_argument("--coordinator-url", default=os.environ.get("AGILLM41_COORDINATOR_URL") or os.environ.get("AGILLM35_COORDINATOR_URL", ""))
     ap.add_argument("--workdir", default=os.environ.get("AGILLM41_JOIN_WORKDIR") or "./agillm41_join_work")
     ap.add_argument("--node-id", default=os.environ.get("AGILLM41_NODE_ID") or os.environ.get("AGILLM35_NODE_ID", ""))

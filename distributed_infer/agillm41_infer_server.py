@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Persistent AGILLM4.1 inference server (model resident).
+"""Persistent AGILLM4.3 inference server (model resident).
 
 Loads the model once, serves POST /generate {prompt, max_new, ...} -> completion.
 Reuses the distributed_infer harness so it runs single-node (local:0:N) today and
@@ -76,7 +76,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--runtime", default="/root/AGILLM4.1/agillm41.py")
+    ap.add_argument("--runtime", default="/root/AGILLM4.3/agillm41.py")
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--stage", action="append")
     ap.add_argument("--device", default="cpu")
