@@ -1855,9 +1855,9 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
         ds_names = get_hot_datasets(ds_names)  # HOT LOAD
     raw = [s.strip() for s in ds_names.split(",") if s.strip()]
     if not raw: return
-    # Weighted interleave across sources ("ref|weight", default 1.0). The old loop
-    # streamed source[0] to exhaustion before touching source[1], so whatever was
-    # listed first (the math synth jsonl) dominated every (re)started stream.
+    # Weighted interleave across sources, with an online single-layer reliability
+    # router on top. Base weights express policy; the router learns which sources
+    # are actually yielding clean text quickly in this run and across restarts.
     sources, weights = [], []
     for s in raw:
         w = 1.0
@@ -1880,6 +1880,147 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
     max_cooldown = float(os.environ.get("AGILLM_STREAM_SOURCE_MAX_COOLDOWN_SEC", "300") or 300)
     fatal_cooldown = float(os.environ.get("AGILLM_STREAM_SOURCE_FATAL_COOLDOWN_SEC", "1800") or 1800)
     fatal_errors = {"DataFilesNotFoundError", "ArrowInvalid", "CastError", "FileNotFoundError"}
+
+    router_enabled = str(os.environ.get("AGILLM_DATASET_NN_ROUTER", "1")).lower() not in {"0", "false", "off", "no"}
+    router_state_path = Path(os.environ.get("AGILLM_DATASET_ROUTER_STATE", "/workspace/agillm_dataset_router_state.json"))
+    router_explore = max(0.0, min(float(os.environ.get("AGILLM_DATASET_ROUTER_EXPLORE", "0.03") or 0.03), 0.50))
+    router_lr = max(0.0, min(float(os.environ.get("AGILLM_DATASET_ROUTER_LR", "0.03") or 0.03), 0.20))
+    router_min_score = max(0.01, min(float(os.environ.get("AGILLM_DATASET_ROUTER_MIN_SCORE", "0.05") or 0.05), 1.0))
+    router_sharpness = max(1.0, min(float(os.environ.get("AGILLM_DATASET_ROUTER_SHARPNESS", "3.0") or 3.0), 8.0))
+    router_log_sec = max(30.0, float(os.environ.get("AGILLM_DATASET_ROUTER_LOG_SEC", "300") or 300))
+    router_save_sec = max(10.0, float(os.environ.get("AGILLM_DATASET_ROUTER_SAVE_SEC", "60") or 60))
+    router_last_log = 0.0
+    router_last_save = 0.0
+
+    def _sigmoid(x):
+        if x < -40.0: return 0.0
+        if x > 40.0: return 1.0
+        return 1.0 / (1.0 + math.exp(-x))
+
+    def _load_router_state():
+        default = {
+            "schema": "agillm.dataset_router.v1",
+            "updated_utc": "",
+            "weights": [-0.25, 0.55, 2.20, -2.80, -0.85, 1.10, -1.70],
+            "sources": {},
+        }
+        try:
+            if router_state_path.exists():
+                loaded = json.loads(router_state_path.read_text())
+                if isinstance(loaded, dict):
+                    default.update({k: loaded.get(k, default[k]) for k in default})
+                    if not isinstance(default.get("sources"), dict):
+                        default["sources"] = {}
+                    if not isinstance(default.get("weights"), list) or len(default["weights"]) != 7:
+                        default["weights"] = [-0.25, 0.55, 2.20, -2.80, -0.85, 1.10, -1.70]
+        except Exception as exc:
+            print(f"[dataset-router] warning: could not load {router_state_path}: {exc}", flush=True)
+        return default
+
+    router = _load_router_state()
+
+    def _source_state(src):
+        st = router.setdefault("sources", {}).setdefault(src, {})
+        st.setdefault("ok_ema", 0.55)
+        st.setdefault("err_ema", 0.05)
+        st.setdefault("lat_ema", 1.0)
+        st.setdefault("tok_ema", 256.0)
+        st.setdefault("empty_ema", 0.05)
+        st.setdefault("pulls", 0)
+        st.setdefault("tokens", 0)
+        st.setdefault("errors", 0)
+        st.setdefault("empty", 0)
+        st.setdefault("last_ok", 0.0)
+        st.setdefault("last_error", "")
+        st.setdefault("last_score", 0.5)
+        return st
+
+    for src in sources:
+        _source_state(src)
+
+    def _router_features(i, now):
+        total_w = max(sum(weights), 1e-9)
+        base = max(weights[i], 0.0) / total_w
+        st = _source_state(sources[i])
+        return [
+            1.0,
+            min(1.0, base * len(weights)),
+            float(st.get("ok_ema", 0.55)),
+            float(st.get("err_ema", 0.05)),
+            min(1.0, float(st.get("lat_ema", 1.0)) / 15.0),
+            min(1.0, float(st.get("tok_ema", 256.0)) / 4096.0),
+            float(st.get("empty_ema", 0.05)),
+        ]
+
+    def _router_score(i, now):
+        if not router_enabled:
+            return 1.0
+        ws = router.get("weights") or []
+        feats = _router_features(i, now)
+        z = sum(float(w) * float(f) for w, f in zip(ws, feats))
+        score = max(router_min_score, min(1.0, _sigmoid(z)))
+        _source_state(sources[i])["last_score"] = score
+        return score
+
+    def _save_router_state(force=False):
+        nonlocal router_last_save
+        now = time.time()
+        if not force and now - router_last_save < router_save_sec:
+            return
+        router_last_save = now
+        try:
+            router["updated_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+            tmp = router_state_path.with_suffix(router_state_path.suffix + ".tmp")
+            tmp.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps(router, indent=2, sort_keys=True) + "\n")
+            tmp.replace(router_state_path)
+        except Exception as exc:
+            print(f"[dataset-router] warning: could not save {router_state_path}: {exc}", flush=True)
+
+    def _router_update(i, label, feat, token_count=0, latency=0.0, err="", empty=False):
+        if i is None:
+            return
+        st = _source_state(sources[i])
+        label = 1.0 if label else 0.0
+        alpha = 0.04
+        st["pulls"] = int(st.get("pulls", 0)) + 1
+        st["ok_ema"] = (1.0 - alpha) * float(st.get("ok_ema", 0.55)) + alpha * label
+        st["err_ema"] = (1.0 - alpha) * float(st.get("err_ema", 0.05)) + alpha * (1.0 - label)
+        st["lat_ema"] = (1.0 - alpha) * float(st.get("lat_ema", 1.0)) + alpha * max(float(latency or 0.0), 0.0)
+        st["tok_ema"] = (1.0 - alpha) * float(st.get("tok_ema", 256.0)) + alpha * max(float(token_count or 0.0), 0.0)
+        st["empty_ema"] = (1.0 - alpha) * float(st.get("empty_ema", 0.05)) + alpha * (1.0 if empty else 0.0)
+        if label >= 0.5:
+            st["tokens"] = int(st.get("tokens", 0)) + int(token_count or 0)
+            st["last_ok"] = time.time()
+            st["last_error"] = ""
+        else:
+            st["errors"] = int(st.get("errors", 0)) + 1
+            st["last_error"] = str(err or "bad_sample")[:120]
+            if empty:
+                st["empty"] = int(st.get("empty", 0)) + 1
+        if router_enabled and feat and router_lr > 0:
+            pred = _sigmoid(sum(float(w) * float(f) for w, f in zip(router["weights"], feat)))
+            grad = label - pred
+            router["weights"] = [max(-8.0, min(8.0, float(w) + router_lr * grad * float(f))) for w, f in zip(router["weights"], feat)]
+        _save_router_state(force=(label < 0.5 or int(st.get("pulls", 0)) <= 3 or (int(st.get("pulls", 0)) % 25 == 0)))
+
+    def _choose_source(available, now):
+        if not router_enabled or _rng.random() < router_explore:
+            return _rng.choices(available, weights=[weights[i] for i in available])[0]
+        eff = []
+        for i in available:
+            score = _router_score(i, now)
+            eff.append(max(1e-9, weights[i] * (score ** router_sharpness)))
+        if sum(eff) <= 0:
+            eff = [weights[i] for i in available]
+        return _rng.choices(available, weights=eff)[0]
+
+    print(
+        f"[dataset-router] nn={'on' if router_enabled else 'off'} explore={router_explore:.3f} "
+        f"state={router_state_path} sources={len(sources)}",
+        flush=True,
+    )
+
     while emitted < target:
         now = time.time()
         available = [i for i, w in enumerate(weights) if w > 0.0 and disabled_until[i] <= now]
@@ -1889,7 +2030,21 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
             print(f"[stream-retry] all sources cooling down, sleeping {sleep_s:.1f}s", flush=True)
             time.sleep(sleep_s)
             continue
-        src_idx = _rng.choices(available, weights=[weights[i] for i in available])[0]
+        if router_enabled and now - router_last_log >= router_log_sec:
+            rows = []
+            for i in range(len(sources)):
+                st = _source_state(sources[i])
+                rows.append((float(st.get("last_score", _router_score(i, now))), i, st))
+            rows.sort(reverse=True)
+            msg = "; ".join(
+                f"{i}:{sources[i][:36]} score={score:.2f} ok={st.get('ok_ema', 0):.2f} err={st.get('err_ema', 0):.2f} tok={st.get('tok_ema', 0):.0f}"
+                for score, i, st in rows[:5]
+            )
+            print(f"[dataset-router] {msg}", flush=True)
+            router_last_log = now
+        src_idx = _choose_source(available, now)
+        feat = _router_features(src_idx, now)
+        t0 = time.perf_counter()
         try:
             if its[src_idx] is None:
                 its[src_idx] = _open_stream_one(sources[src_idx], seed + src_idx, streaming=streaming)
@@ -1903,7 +2058,8 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
                         text = ex[dataset_field_text]
                     elif isinstance(ex.get("text"), str):
                         text = ex["text"]
-            if not isinstance(text, str):
+            if not isinstance(text, str) or not text.strip():
+                _router_update(src_idx, 0, feat, latency=time.perf_counter() - t0, err="empty_or_missing_text", empty=True)
                 continue
             if fail_counts[src_idx]:
                 print(f"[stream-recover] {sources[src_idx]} recovered after {fail_counts[src_idx]} failures", flush=True)
@@ -1912,16 +2068,23 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
             enc = tok.encode(text)
             if EOS is not None and (len(enc) == 0 or enc[-1] != EOS):
                 enc = enc + [EOS]
+            if not enc:
+                _router_update(src_idx, 0, feat, latency=time.perf_counter() - t0, err="empty_tokens", empty=True)
+                continue
+            _router_update(src_idx, 1, feat, token_count=len(enc), latency=time.perf_counter() - t0)
             for t in enc:
                 yield t
                 emitted += 1
-                if emitted >= target: return
+                if emitted >= target:
+                    _save_router_state(force=True)
+                    return
         except StopIteration:
             its[src_idx] = None  # exhausted: reopen on next pick (stream cycles)
         except Exception as e:
             its[src_idx] = None
             fail_counts[src_idx] += 1
             err = type(e).__name__
+            _router_update(src_idx, 0, feat, latency=time.perf_counter() - t0, err=err)
             cooldown = min(max_cooldown, backoff_base ** min(fail_counts[src_idx], 8))
             if err in fatal_errors:
                 cooldown = max(cooldown, fatal_cooldown)
