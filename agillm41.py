@@ -1892,6 +1892,35 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
     router_last_log = 0.0
     router_last_save = 0.0
 
+    def _env_bool(name, default=False):
+        return str(os.environ.get(name, "1" if default else "0")).strip().lower() not in {"", "0", "false", "off", "no"}
+
+    def _env_float(name, default, lo=None, hi=None):
+        try:
+            val = float(os.environ.get(name, str(default)) or default)
+        except Exception:
+            val = float(default)
+        if lo is not None:
+            val = max(float(lo), val)
+        if hi is not None:
+            val = min(float(hi), val)
+        return val
+
+    agent_enabled = _env_bool("AGILLM_DATASET_AGENT_ROUTER", False)
+    agent_timeout = _env_float("AGILLM_DATASET_AGENT_TIMEOUT_SEC", 8.0, 1.0, 60.0)
+    agent_min_interval = _env_float("AGILLM_DATASET_AGENT_MIN_INTERVAL_SEC", 600.0, 30.0, 86400.0)
+    agent_source_interval = _env_float("AGILLM_DATASET_AGENT_SOURCE_INTERVAL_SEC", 900.0, 30.0, 86400.0)
+    agent_fail_threshold = int(_env_float("AGILLM_DATASET_AGENT_FAILS", 2.0, 1.0, 50.0))
+    agent_min_pulls = int(_env_float("AGILLM_DATASET_AGENT_MIN_PULLS", 4.0, 1.0, 1000.0))
+    agent_err_threshold = _env_float("AGILLM_DATASET_AGENT_ERR_EMA", 0.18, 0.01, 1.0)
+    agent_empty_threshold = _env_float("AGILLM_DATASET_AGENT_EMPTY_EMA", 0.20, 0.01, 1.0)
+    agent_latency_threshold = _env_float("AGILLM_DATASET_AGENT_LATENCY_SEC", 20.0, 1.0, 600.0)
+    agent_min_conf = _env_float("AGILLM_DATASET_AGENT_MIN_CONF", 0.25, 0.0, 1.0)
+    agent_default_penalty = _env_float("AGILLM_DATASET_AGENT_PENALTY", 0.35, 0.01, 1.0)
+    agent_default_cooldown = _env_float("AGILLM_DATASET_AGENT_COOLDOWN_SEC", 900.0, 30.0, 86400.0)
+    agent_disable_sec = _env_float("AGILLM_DATASET_AGENT_DISABLE_SEC", 21600.0, 60.0, 604800.0)
+    agent_last_call = 0.0
+
     def _sigmoid(x):
         if x < -40.0: return 0.0
         if x > 40.0: return 1.0
@@ -1903,6 +1932,7 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
             "updated_utc": "",
             "weights": [-0.25, 0.55, 2.20, -2.80, -0.85, 1.10, -1.70],
             "sources": {},
+            "agent": {},
         }
         try:
             if router_state_path.exists():
@@ -1918,6 +1948,11 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
         return default
 
     router = _load_router_state()
+    router.setdefault("agent", {})
+    try:
+        agent_last_call = float(router["agent"].get("last_call", 0.0) or 0.0)
+    except Exception:
+        agent_last_call = 0.0
 
     def _source_state(src):
         st = router.setdefault("sources", {}).setdefault(src, {})
@@ -1933,6 +1968,12 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
         st.setdefault("last_ok", 0.0)
         st.setdefault("last_error", "")
         st.setdefault("last_score", 0.5)
+        st.setdefault("agent_score_mult", 1.0)
+        st.setdefault("agent_penalty_until", 0.0)
+        st.setdefault("agent_last_check", 0.0)
+        st.setdefault("agent_last_action", "")
+        st.setdefault("agent_last_reason", "")
+        st.setdefault("agent_last_error", "")
         return st
 
     for src in sources:
@@ -1959,7 +2000,18 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
         feats = _router_features(i, now)
         z = sum(float(w) * float(f) for w, f in zip(ws, feats))
         score = max(router_min_score, min(1.0, _sigmoid(z)))
-        _source_state(sources[i])["last_score"] = score
+        st = _source_state(sources[i])
+        try:
+            until = float(st.get("agent_penalty_until", 0.0) or 0.0)
+            mult = max(0.01, min(2.0, float(st.get("agent_score_mult", 1.0) or 1.0)))
+        except Exception:
+            until, mult = 0.0, 1.0
+        if until > now:
+            score = max(router_min_score, min(1.0, score * mult))
+        elif until or mult != 1.0:
+            st["agent_score_mult"] = 1.0
+            st["agent_penalty_until"] = 0.0
+        st["last_score"] = score
         return score
 
     def _save_router_state(force=False):
@@ -1976,6 +2028,232 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
             tmp.replace(router_state_path)
         except Exception as exc:
             print(f"[dataset-router] warning: could not save {router_state_path}: {exc}", flush=True)
+
+    def _agent_read_secret(env_names, paths):
+        for name in env_names:
+            val = os.environ.get(name, "")
+            if val.strip():
+                return val.strip()
+        for raw_path in paths:
+            try:
+                p = Path(raw_path).expanduser()
+                if p.exists():
+                    val = p.read_text(errors="ignore").strip()
+                    if val:
+                        return val
+            except Exception:
+                pass
+        return ""
+
+    def _agent_provider_key_model():
+        pref = str(os.environ.get("AGILLM_DATASET_AGENT_PROVIDER", "auto") or "auto").strip().lower()
+        deepseek_key = _agent_read_secret(
+            ("DEEPSEEK_API_KEY", "AGILLM_DEEPSEEK_API_KEY"),
+            (
+                "/root/.config/agillm/deepseek_api_key",
+                "/workspace/private/deepseek_api_key",
+                "/workspace/agillm_private/deepseek_api_key",
+            ),
+        )
+        openrouter_key = _agent_read_secret(
+            ("OPENROUTER_API_KEY", "AGILLM_OPENROUTER_API_KEY"),
+            (
+                "/root/.config/agillm/openrouter_api_key",
+                "/workspace/private/openrouter_api_key",
+                "/workspace/agillm_private/openrouter_api_key",
+            ),
+        )
+        deepseek_model = os.environ.get("AGILLM_DATASET_AGENT_DEEPSEEK_MODEL", "deepseek-chat")
+        openrouter_model = os.environ.get("AGILLM_DATASET_AGENT_OPENROUTER_MODEL", "deepseek/deepseek-chat-v3-0324")
+        if pref == "deepseek":
+            return "deepseek", deepseek_key, deepseek_model, "configured" if deepseek_key else "missing-key"
+        if pref == "openrouter":
+            return "openrouter", openrouter_key, openrouter_model, "configured" if openrouter_key else "missing-key"
+        if deepseek_key:
+            return "deepseek", deepseek_key, deepseek_model, "configured"
+        if openrouter_key:
+            return "openrouter", openrouter_key, openrouter_model, "configured"
+        return "auto", "", "", "missing-key"
+
+    def _agent_extract_json(text):
+        text = str(text or "").strip()
+        if not text:
+            return {}
+        try:
+            obj = json.loads(text)
+            return obj if isinstance(obj, dict) else {}
+        except Exception:
+            pass
+        start, end = text.find("{"), text.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                obj = json.loads(text[start:end + 1])
+                return obj if isinstance(obj, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    def _agent_call(provider, key, model, payload):
+        import urllib.error
+        import urllib.request
+        if provider == "deepseek":
+            url = "https://api.deepseek.com/chat/completions"
+            headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json"}
+        elif provider == "openrouter":
+            url = "https://openrouter.ai/api/v1/chat/completions"
+            headers = {
+                "Authorization": "Bearer " + key,
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://join.opentransformers.online",
+                "X-Title": "AGILLM dataset router",
+            }
+        else:
+            return False, "unknown_provider"
+        system = (
+            "You are a dataset routing policy agent for an active neural-network training run. "
+            "Return compact JSON only. You may advise rerouting, cooldown, penalizing, disabling, keeping, or recovering a dataset source. "
+            "Never create, rewrite, summarize, or transform training samples. "
+            "Allowed actions: keep, penalize, cooldown, disable, recover. "
+            "Use score_multiplier between 0.01 and 2.0 and cooldown_sec as seconds."
+        )
+        body = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(payload, sort_keys=True)},
+            ],
+            "temperature": 0,
+            "max_tokens": 180,
+        }
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=agent_timeout) as resp:
+                raw = resp.read(32768).decode("utf-8", errors="replace")
+            parsed = json.loads(raw)
+            content = (((parsed.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
+            if not content and isinstance(parsed.get("output"), str):
+                content = parsed["output"]
+            return True, content
+        except urllib.error.HTTPError as exc:
+            return False, f"HTTP{getattr(exc, 'code', 'error')}"
+        except Exception as exc:
+            return False, type(exc).__name__
+
+    def _agent_maybe_advise(i, event):
+        nonlocal agent_last_call
+        if not agent_enabled or i is None:
+            return
+        now = time.time()
+        st = _source_state(sources[i])
+        pulls = int(st.get("pulls", 0))
+        errors = int(st.get("errors", 0))
+        if pulls < agent_min_pulls and errors < agent_fail_threshold:
+            return
+        bad_enough = (
+            fail_counts[i] >= agent_fail_threshold
+            or errors >= agent_fail_threshold
+            or float(st.get("err_ema", 0.0)) >= agent_err_threshold
+            or float(st.get("empty_ema", 0.0)) >= agent_empty_threshold
+            or float(st.get("lat_ema", 0.0)) >= agent_latency_threshold
+        )
+        if not bad_enough:
+            return
+        if now - agent_last_call < agent_min_interval:
+            return
+        if now - float(st.get("agent_last_check", 0.0) or 0.0) < agent_source_interval:
+            return
+        provider, key, model, status = _agent_provider_key_model()
+        if not key:
+            router.setdefault("agent", {})["last_status"] = status
+            st["agent_last_check"] = now
+            st["agent_last_error"] = status
+            _save_router_state(force=True)
+            return
+        st["agent_last_check"] = now
+        router.setdefault("agent", {})["last_call"] = now
+        router["agent"]["last_provider"] = provider
+        router["agent"]["last_model"] = model
+        agent_last_call = now
+        payload = {
+            "source_index": i,
+            "source": sources[i],
+            "event": str(event or "failure")[:120],
+            "policy": "reroute/cooldown only; never generate or modify data",
+            "stats": {
+                "pulls": pulls,
+                "errors": errors,
+                "empty": int(st.get("empty", 0)),
+                "fail_count": int(fail_counts[i]),
+                "ok_ema": float(st.get("ok_ema", 0.0)),
+                "err_ema": float(st.get("err_ema", 0.0)),
+                "empty_ema": float(st.get("empty_ema", 0.0)),
+                "lat_ema": float(st.get("lat_ema", 0.0)),
+                "tok_ema": float(st.get("tok_ema", 0.0)),
+                "router_score": float(st.get("last_score", 0.5)),
+                "disabled_for_sec": max(0.0, float(disabled_until[i]) - now),
+                "agent_score_mult": float(st.get("agent_score_mult", 1.0) or 1.0),
+            },
+            "return_schema": {
+                "action": "keep|penalize|cooldown|disable|recover",
+                "score_multiplier": 0.35,
+                "cooldown_sec": 900,
+                "confidence": 0.5,
+                "reason": "short reason",
+            },
+        }
+        ok, content = _agent_call(provider, key, model, payload)
+        if not ok:
+            st["agent_last_error"] = str(content)[:120]
+            print(f"[dataset-agent] provider={provider} model={model} src={i}:{sources[i][:42]} error={content}", flush=True)
+            _save_router_state(force=True)
+            return
+        advice = _agent_extract_json(content)
+        action = str(advice.get("action", "keep") or "keep").strip().lower()
+        if action not in {"keep", "penalize", "cooldown", "disable", "recover"}:
+            action = "keep"
+        try:
+            confidence = max(0.0, min(1.0, float(advice.get("confidence", 0.0) or 0.0)))
+        except Exception:
+            confidence = 0.0
+        if confidence < agent_min_conf:
+            action = "keep"
+        try:
+            mult = max(0.01, min(2.0, float(advice.get("score_multiplier", agent_default_penalty) or agent_default_penalty)))
+        except Exception:
+            mult = agent_default_penalty
+        try:
+            cooldown_sec = max(0.0, float(advice.get("cooldown_sec", agent_default_cooldown) or agent_default_cooldown))
+        except Exception:
+            cooldown_sec = agent_default_cooldown
+        reason = str(advice.get("reason", "") or "")[:180]
+        if action == "recover":
+            st["agent_score_mult"] = 1.0
+            st["agent_penalty_until"] = 0.0
+            disabled_until[i] = 0.0
+        elif action == "penalize":
+            st["agent_score_mult"] = min(float(st.get("agent_score_mult", 1.0) or 1.0), mult)
+            st["agent_penalty_until"] = max(float(st.get("agent_penalty_until", 0.0) or 0.0), now + max(cooldown_sec, agent_default_cooldown))
+        elif action == "cooldown":
+            st["agent_score_mult"] = min(float(st.get("agent_score_mult", 1.0) or 1.0), mult)
+            until = now + max(cooldown_sec, agent_default_cooldown)
+            st["agent_penalty_until"] = max(float(st.get("agent_penalty_until", 0.0) or 0.0), until)
+            disabled_until[i] = max(disabled_until[i], until)
+        elif action == "disable":
+            st["agent_score_mult"] = min(float(st.get("agent_score_mult", 1.0) or 1.0), min(mult, agent_default_penalty))
+            until = now + max(cooldown_sec, agent_disable_sec)
+            st["agent_penalty_until"] = max(float(st.get("agent_penalty_until", 0.0) or 0.0), until)
+            disabled_until[i] = max(disabled_until[i], until)
+        st["agent_last_action"] = action
+        st["agent_last_reason"] = reason
+        st["agent_last_error"] = ""
+        router.setdefault("agent", {})["last_status"] = "ok"
+        _save_router_state(force=True)
+        print(
+            f"[dataset-agent] provider={provider} model={model} src={i}:{sources[i][:42]} "
+            f"event={str(event)[:40]} action={action} mult={mult:.2f} cooldown={cooldown_sec:.0f}s conf={confidence:.2f} reason={reason}",
+            flush=True,
+        )
 
     def _router_update(i, label, feat, token_count=0, latency=0.0, err="", empty=False):
         if i is None:
@@ -2015,9 +2293,16 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
             eff = [weights[i] for i in available]
         return _rng.choices(available, weights=eff)[0]
 
+    agent_provider, agent_key, agent_model, agent_status = _agent_provider_key_model()
+    if not agent_enabled:
+        agent_desc = "off"
+    elif agent_key:
+        agent_desc = f"{agent_provider}:{agent_model}"
+    else:
+        agent_desc = f"{agent_provider}:missing-key"
     print(
         f"[dataset-router] nn={'on' if router_enabled else 'off'} explore={router_explore:.3f} "
-        f"state={router_state_path} sources={len(sources)}",
+        f"agent={agent_desc} state={router_state_path} sources={len(sources)}",
         flush=True,
     )
 
@@ -2060,6 +2345,7 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
                         text = ex["text"]
             if not isinstance(text, str) or not text.strip():
                 _router_update(src_idx, 0, feat, latency=time.perf_counter() - t0, err="empty_or_missing_text", empty=True)
+                _agent_maybe_advise(src_idx, "empty_or_missing_text")
                 continue
             if fail_counts[src_idx]:
                 print(f"[stream-recover] {sources[src_idx]} recovered after {fail_counts[src_idx]} failures", flush=True)
@@ -2070,6 +2356,7 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
                 enc = enc + [EOS]
             if not enc:
                 _router_update(src_idx, 0, feat, latency=time.perf_counter() - t0, err="empty_tokens", empty=True)
+                _agent_maybe_advise(src_idx, "empty_tokens")
                 continue
             _router_update(src_idx, 1, feat, token_count=len(enc), latency=time.perf_counter() - t0)
             for t in enc:
@@ -2089,6 +2376,7 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
             if err in fatal_errors:
                 cooldown = max(cooldown, fatal_cooldown)
             disabled_until[src_idx] = time.time() + cooldown
+            _agent_maybe_advise(src_idx, err)
             if time.time() - last_retry_log[src_idx] > 15.0 or fail_counts[src_idx] <= 2:
                 print(
                     f"[stream-retry] {sources[src_idx]} error: {err}, "
@@ -4879,6 +5167,41 @@ def _agillm43_prepare_env(save_dir, side_dir):
         if token:
             env["HF_TOKEN"] = token
             env["HUGGING_FACE_HUB_TOKEN"] = token
+
+    def _agillm43_load_secret_file(env_name, paths):
+        if env.get(env_name, "").strip():
+            return True
+        for raw_path in paths:
+            try:
+                p = Path(raw_path)
+                if p.exists():
+                    val = p.read_text(errors="ignore").strip()
+                    if val:
+                        env[env_name] = val
+                        return True
+            except Exception:
+                pass
+        return False
+
+    have_deepseek = _agillm43_load_secret_file(
+        "DEEPSEEK_API_KEY",
+        (
+            "/root/.config/agillm/deepseek_api_key",
+            "/workspace/private/deepseek_api_key",
+            "/workspace/agillm_private/deepseek_api_key",
+        ),
+    )
+    have_openrouter = _agillm43_load_secret_file(
+        "OPENROUTER_API_KEY",
+        (
+            "/root/.config/agillm/openrouter_api_key",
+            "/workspace/private/openrouter_api_key",
+            "/workspace/agillm_private/openrouter_api_key",
+        ),
+    )
+    if have_deepseek or have_openrouter:
+        env.setdefault("AGILLM_DATASET_AGENT_ROUTER", "1")
+        env.setdefault("AGILLM_DATASET_AGENT_PROVIDER", "auto")
     Path(save_dir).mkdir(parents=True, exist_ok=True)
     for name in ("incoming", "accepted", "rejected"):
         (Path(side_dir) / name).mkdir(parents=True, exist_ok=True)
