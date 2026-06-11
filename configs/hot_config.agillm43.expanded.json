@@ -1,0 +1,16 @@
+{
+  "datasets": [
+    "json:/workspace/agillm_math_numeracy_synth/train.jsonl|0.12",
+    "OpenTransformer/web-crawl-clean-v2|1.60",
+    "HuggingFaceFW/fineweb|3.00",
+    "HuggingFaceFW/fineweb-edu:sample-10BT|2.40",
+    "Skylion007/openwebtext|1.20",
+    "wikimedia/wikipedia:20231101.en|1.00",
+    "allenai/c4:en|0.80",
+    "OpenTransformer/goddess-crawl|0.75",
+    "roneneldan/TinyStories|0.55",
+    "open-web-math/open-web-math|0.30"
+  ],
+  "notes": "Expanded 2026-06-11: adds FineWeb-Edu, OpenWebText, TinyStories, goddess-crawl, and small OpenWebMath; reduces local numeracy weight to avoid math-heavy babble. Proof-Pile-2 was probed and skipped because installed datasets rejects dataset scripts.",
+  "updated_utc": "2026-06-11T04:28:52Z"
+}
