@@ -227,29 +227,11 @@ class LeaseStore:
 
     def request(self, node_id: str, capabilities: dict[str, Any]) -> dict[str, Any] | None:
         with self.lock:
-            # one active lease per node (no hoarding)
-            for lf in (self.spool / "leased").glob("*.json"):
-                ll = read_json(lf, {})
-                if ll.get("node_id") == node_id and utc() <= int(ll.get("expires_at", 0) or 0):
-                    return None
             candidates = sorted((self.spool / "available").glob("*.json"))
             if not candidates:
                 return None
-            # Device-aware and cheap-first: GPU workers prefer gpu-tier leases;
-            # CPU/unknown workers prefer the smallest cpu-tier lease so public
-            # volunteers do not accidentally pull a large GPU package.
-            _dev = (capabilities.get("device") or (capabilities.get("machine") or {}).get("best_device") or "cpu")
-            _want = "gpu" if str(_dev).lower() in ("cuda", "directml", "gpu") else "cpu"
-            ranked = []
-            for _c in candidates:
-                _lease = read_json(_c, {})
-                _tier = ((_lease.get("metadata") or {}).get("tier") or "cpu")
-                _size = int((_lease.get("package") or {}).get("bytes") or 0)
-                _match = 0 if _tier == _want else 1
-                ranked.append((_match, _size, _c.name, _c, _lease))
-            ranked.sort()
-            src = ranked[0][3]
-            lease = ranked[0][4]
+            src = candidates[0]
+            lease = read_json(src, {})
             lease_id = secrets.token_urlsafe(18)
             expires_at = utc() + int(lease.get("ttl_sec", 900))
             lease.update(
@@ -269,46 +251,6 @@ class LeaseStore:
             src.unlink()
         return self.public_lease(lease, token)
 
-    _PKG_ROOT = "/root/agillm41_worker/packages"
-    # Cloudflare-fronted, cached download origin for package/frozen GETs. Packages are
-    # sliced (<=3 layers ~393MB) + fp16 frozen (~331MB) so they fit under CF Free's
-    # 512MB cache limit. The API + large result-upload stay on join. (unproxied) since
-    # submits exceed CF's 100MB upload body limit. Override with AGILLM_DL_BASE.
-    import os as _os
-    _DL_BASE = (_os.environ.get("AGILLM_DL_BASE", "https://dl.opentransformers.online")).rstrip("/")
-    # Size-unlimited free CDN fallback: a public Hugging Face dataset mirror of the
-    # same /pkg/ tree. Used only if the CF/dl. primary fails (sha256 verified either
-    # way). Empty AGILLM_HF_MIRROR_BASE disables it. Updated each round by the mirror job.
-    _MIRROR_BASE = (_os.environ.get("AGILLM_HF_MIRROR_BASE",
-        "https://huggingface.co/datasets/OpenTransformer/agillm41-lease-packages/resolve/main")).rstrip("/")
-
-    def _pkg_static_url(self, fp: str):
-        """Return a fast CF-cached /pkg/ download URL if fp is under the packages root."""
-        try:
-            import os
-            if not fp:
-                return None
-            rp = os.path.relpath(fp, self._PKG_ROOT)
-            if rp.startswith("..") or os.path.isabs(rp):
-                return None
-            base = self._DL_BASE or self.public_base_url
-            return base + "/pkg/" + rp
-        except Exception:
-            return None
-
-    def _pkg_mirror_url(self, fp: str):
-        """Return the HF dataset mirror URL for the same /pkg/ relpath, or None."""
-        try:
-            import os
-            if not fp or not self._MIRROR_BASE:
-                return None
-            rp = os.path.relpath(fp, self._PKG_ROOT)
-            if rp.startswith("..") or os.path.isabs(rp):
-                return None
-            return self._MIRROR_BASE + "/pkg/" + rp
-        except Exception:
-            return None
-
     def public_lease(self, lease: dict[str, Any], token: str) -> dict[str, Any]:
         lease_id = lease["lease_id"]
         out = {
@@ -317,8 +259,7 @@ class LeaseStore:
             "token": token,
             "expires_at": lease["expires_at"],
             "package": {
-                "url": (self._pkg_static_url(lease["package"].get("path", "")) or f"{self.public_base_url}/api/v1/leases/{lease_id}/package"),
-                "mirror_url": self._pkg_mirror_url(lease["package"].get("path", "")),
+                "url": f"{self.public_base_url}/api/v1/leases/{lease_id}/package",
                 "sha256": lease["package"]["sha256"],
                 "bytes": lease["package"]["bytes"],
                 "name": lease["package"]["name"],
@@ -334,8 +275,7 @@ class LeaseStore:
         }
         if "frozen" in lease:
             out["frozen"] = {
-                "url": (self._pkg_static_url(lease["frozen"].get("path", "")) or f"{self.public_base_url}/api/v1/leases/{lease_id}/frozen"),
-                "mirror_url": self._pkg_mirror_url(lease["frozen"].get("path", "")),
+                "url": f"{self.public_base_url}/api/v1/leases/{lease_id}/frozen",
                 "sha256": lease["frozen"]["sha256"],
                 "bytes": lease["frozen"]["bytes"],
                 "name": lease["frozen"]["name"],

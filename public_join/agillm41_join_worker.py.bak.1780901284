@@ -56,8 +56,7 @@ def http_json(url: str, payload: dict[str, Any], insecure: bool) -> tuple[int, d
 
 def download(url: str, dest: Path, expected_sha: str, token: str, insecure: bool) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
-    req = Request(url, headers=headers)
+    req = Request(url, headers={"Authorization": f"Bearer {token}"})
     tmp = dest.with_suffix(dest.suffix + ".part")
     h = hashlib.sha256()
     with urlopen(req, context=ssl_context(insecure), timeout=300) as r, tmp.open("wb") as f:
@@ -107,20 +106,8 @@ def cache_artifact(lease: dict[str, Any], key: str, cache_dir: Path, token: str,
     dest = cache_dir / f"{spec['sha256'][:16]}_{spec['name']}"
     if dest.exists() and sha256_file(dest).lower() == spec["sha256"].lower():
         return dest
-    # Primary = Cloudflare-fronted dl. subdomain (lease token); fall back to the
-    # public Hugging Face mirror (no token) so a CF/origin hiccup can't strand a
-    # volunteer. sha256 is verified either way, so a bad mirror just retries.
-    attempts = [(spec["url"], token)]
-    if spec.get("mirror_url"):
-        attempts.append((spec["mirror_url"], ""))
-    last_err = None
-    for _u, _tok in attempts:
-        try:
-            download(_u, dest, spec["sha256"], _tok, insecure)
-            return dest
-        except Exception as exc:  # noqa: BLE001 - try next mirror
-            last_err = exc
-    raise last_err if last_err else RuntimeError("no download url for " + key)
+    download(spec["url"], dest, spec["sha256"], token, insecure)
+    return dest
 
 
 def default_worker_cmd(args: argparse.Namespace, lease: dict[str, Any], package: Path, frozen: Path | None, out: Path) -> list[str]:

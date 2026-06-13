@@ -43,3 +43,35 @@ Trusted-core operations live in the private repo `Marxist-Leninist/agillm4.3-pri
 ## Hugging Face
 
 Public model card and checkpoint lineage: https://hf.co/OpenTransformer/AGILLM-4.3
+
+## Run Your Own Federated Network
+
+If you want to host your own decentralized training swarm for AGILLM models, you can run the volunteer coordinator and validation endpoints yourself.
+
+1. **Start the Network Host (Coordinator):**
+   This script runs a FastHTML web server that distributes training leases to workers and receives asynchronous `.pt` gradient updates.
+   ```bash
+   python public_join/agillm41_network_host.py \
+     --host 0.0.0.0 \
+     --port 8787 \
+     --spool ./agillm41_lease_spool \
+     --public-base-url http://YOUR_IP:8787
+   ```
+
+2. **Add Packages (Master Node):**
+   Your master training loop exports bench packages which are added to the spool:
+   ```bash
+   python public_join/agillm41_network_host.py add-lease \
+     --spool ./agillm41_lease_spool \
+     --package /path/to/exported_bench_pkg.pt \
+     --base-ckpt /path/to/base_model.pt
+   ```
+
+3. **Validate Results:**
+   Once workers submit results to the quarantine directory in the spool, you must validate them before your master applies them.
+   ```bash
+   python public_join/agillm41_validate_and_credit.py \
+     --spool ./agillm41_lease_spool \
+     --base-ckpt /path/to/base_model.pt
+   ```
+   Validated updates will be moved to an `accepted/` directory which your master can then asynchronously merge.

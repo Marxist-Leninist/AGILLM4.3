@@ -1621,7 +1621,7 @@ CKDIR = pathlib.Path("ckpts_expansion")
 DEFAULT_PRETRAIN_SOURCES = "LLM360/TxT360,OpenTransformer/goddess-crawl,OpenTransformer/agillm-crawl-data,OpenTransformer/web-crawl-2026,OpenTransformer/web-crawl-clean-v2,OpenTransformer/scraped-web-data,OpenTransformer/turbo-crawl,OpenTransformer/sft-data-clean,OpenTransformer/web-crawl-v1,HuggingFaceFW/fineweb,wikimedia/wikipedia:20231101.en,allenai/c4:en,EleutherAI/proof-pile-2"
 DEFAULT_AFTER_SFT_SOURCES = "mlabonne/opc-sft-stage2-chat,HuggingFaceH4/ultrachat_200k@train_sft"
 DEFAULT_AFTER_SFT_BLOCK = 768
-DEFAULT_ATTN_BACKEND = os.environ.get("AGILLM_ATTN_BACKEND", "sublinear")
+DEFAULT_ATTN_BACKEND = os.environ.get("AGILLM_ATTN_BACKEND", "manual")
 
 def _env_int(name: str, default: int) -> int:
     try:
@@ -1629,9 +1629,9 @@ def _env_int(name: str, default: int) -> int:
     except (TypeError, ValueError):
         return default
 
-DEFAULT_SUBLINEAR_WINDOW = _env_int("AGILLM_SUBLINEAR_WINDOW", 128)
-DEFAULT_SUBLINEAR_STRIDE = _env_int("AGILLM_SUBLINEAR_STRIDE", 128)
-DEFAULT_SUBLINEAR_MAX_ANCHORS = _env_int("AGILLM_SUBLINEAR_MAX_ANCHORS", 128)
+DEFAULT_SUBLINEAR_WINDOW = _env_int("AGILLM_SUBLINEAR_WINDOW", 256)
+DEFAULT_SUBLINEAR_STRIDE = _env_int("AGILLM_SUBLINEAR_STRIDE", 64)
+DEFAULT_SUBLINEAR_MAX_ANCHORS = _env_int("AGILLM_SUBLINEAR_MAX_ANCHORS", 256)
 DEFAULT_SUBLINEAR_CHUNK = _env_int("AGILLM_SUBLINEAR_CHUNK", 128)
 DEFAULT_SUBLINEAR_SINKS = _env_int("AGILLM_SUBLINEAR_SINKS", 4)
 DEFAULT_SUBLINEAR_RECENT_ANCHORS = _env_int("AGILLM_SUBLINEAR_RECENT_ANCHORS", -1)  # -1 = half of max anchors
@@ -1757,19 +1757,7 @@ def _auto_amp_dtype():
     return torch.float32
 
 def amp(enabled: bool):
-    if not enabled or DEV.type != "cuda":
-        return nullcontext()
-    dtype = _auto_amp_dtype()
-    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
-        try:
-            return torch.amp.autocast("cuda", dtype=dtype)
-        except TypeError:
-            try:
-                return torch.amp.autocast(device_type="cuda", dtype=dtype)
-            except TypeError:
-                pass
-    return torch.cuda.amp.autocast(dtype=dtype)
-
+    return nullcontext() if not (enabled and DEV.type == "cuda") else _ac(device_type="cuda", dtype=_auto_amp_dtype())
 
 def _needs_grad_scaler() -> bool:
     return bool(DEV.type == "cuda" and _auto_amp_dtype() == torch.float16)
@@ -2414,7 +2402,7 @@ def _alibi_slopes(n_heads: int):
 def alibi_bias(n_heads: int, n_tokens: int):
     i = torch.arange(n_tokens, device=DEV).view(1, 1, n_tokens, 1)
     j = torch.arange(n_tokens, device=DEV).view(1, 1, 1, n_tokens)
-    dist = (j - i).abs() 
+    dist = (j - i).clamp_min(0) 
     return -_alibi_slopes(n_heads) * dist
 
 
@@ -2778,8 +2766,6 @@ class TuneableAttentionMHA(nn.Module):
         if self.attn_backend != "sublinear" and self.use_relpos and rel_bias_tokens is not None:
             rel = alibi_bias(self.h, rel_bias_tokens)[:, :, -q.size(2):, :].to(device=q.device, dtype=q.dtype)
             attn_mask = rel if attn_mask is None else attn_mask + rel
-        if self.attn_backend == "sdpa" and attn_mask is not None and attn_mask.dtype != torch.bool and attn_mask.dtype != q.dtype:
-            attn_mask = attn_mask.to(dtype=q.dtype)
         if self.attn_backend == "sdpa":
             try:
                 z = F.scaled_dot_product_attention(
@@ -2799,7 +2785,7 @@ class TuneableAttentionMHA(nn.Module):
             att = (q @ k.transpose(-1, -2)) / math.sqrt(self.dk)
             if attn_mask is not None:
                 att = att + attn_mask
-            z = att.softmax(-1).to(v.dtype) @ v
+            z = att.softmax(-1) @ v
         z = z.transpose(1, 2).reshape(x.size(0), x.size(1), -1)
         out = self.drop(self.proj(z))
         if not use_cache:
@@ -2841,30 +2827,6 @@ class MoEFFN(nn.Module):
         # Detached FFN input stashed each training forward; the router aux loss is
         # recomputed OUTSIDE the gradient-checkpoint boundary by _collect_moe_aux().
         self.last_router_input = None
-        # Inference-only expert streaming: block-stream can keep only router/shared
-        # paths resident and page selected routed experts on demand.
-        self.expert_stream = False
-        self.expert_stream_empty_cache = True
-        self.expert_stream_stats = {"loads": 0, "tokens": 0}
-
-    def set_expert_stream(self, enabled: bool, empty_cache: bool = True):
-        self.expert_stream = bool(enabled)
-        self.expert_stream_empty_cache = bool(empty_cache)
-        return self
-
-    def _run_expert(self, expert, rows):
-        if self.expert_stream and torch.is_tensor(rows) and rows.is_cuda:
-            expert.to(rows.device)
-            try:
-                out = expert(rows)
-            finally:
-                expert.to("cpu")
-                self.expert_stream_stats["loads"] = int(self.expert_stream_stats.get("loads", 0)) + 1
-                self.expert_stream_stats["tokens"] = int(self.expert_stream_stats.get("tokens", 0)) + int(rows.size(0))
-                if self.expert_stream_empty_cache and torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            return out
-        return expert(rows)
 
     def _shared_out(self, flat):
         if self.shared is None:
@@ -2883,8 +2845,7 @@ class MoEFFN(nn.Module):
             # without grad (checkpoint's no-grad first pass) or pin block activations
             # across the checkpoint boundary and blow up VRAM.
             self.last_router_input = flat.detach()
-        router_in = flat.to(self.router.weight.dtype) if flat.dtype != self.router.weight.dtype else flat
-        scores = self.router(router_in).float()
+        scores = self.router(flat.float())
 
         if self.top_k == 1:
             probs = scores.softmax(dim=-1)
@@ -2898,7 +2859,7 @@ class MoEFFN(nn.Module):
                 # Keep the forward value equal to the selected expert while
                 # sending a straight-through gradient into the top-1 router.
                 gate_st = (gate / gate.detach()).unsqueeze(-1)
-                out[mask] = self._run_expert(expert, flat[mask]) * gate_st
+                out[mask] = expert(flat[mask]) * gate_st
             if self.shared is not None:
                 out = out + self._shared_out(flat)
             return out.reshape(orig_shape)
@@ -2913,7 +2874,7 @@ class MoEFFN(nn.Module):
                 rows = (chosen == expert_id).nonzero(as_tuple=False).flatten()
                 if rows.numel() == 0:
                     continue
-                out.index_add_(0, rows, self._run_expert(expert, flat.index_select(0, rows)) * weight.index_select(0, rows))
+                out.index_add_(0, rows, expert(flat.index_select(0, rows)) * weight.index_select(0, rows))
         if self.shared is not None:
             out = out + self._shared_out(flat)
         return out.reshape(orig_shape)
@@ -2965,8 +2926,7 @@ def _collect_moe_aux(model, aux_coef=0.0, z_coef=0.0):
             m.last_router_input = None
             if inp is None or (aux_coef <= 0 and z_coef <= 0):
                 continue
-            router_in = inp.to(m.router.weight.dtype) if inp.dtype != m.router.weight.dtype else inp
-            scores = m.router(router_in).float()
+            scores = m.router(inp.float())
             probs = scores.softmax(dim=-1)
             importance = probs.mean(dim=0)
             top1 = probs.argmax(dim=-1)
@@ -4465,53 +4425,6 @@ def _train_phase(
                     )
                 except Exception:
                     mem = ""
-            try:
-                heartbeat_payload = {
-                    "schema": "agillm.run_state.v1",
-                    "model": "AGILLM4.3",
-                    "phase": "training",
-                    "trainer_phase": phase_name,
-                    "pid": int(os.getpid()),
-                    "step": int(step),
-                    "seen_tok": int(seen_tok),
-                    "loss": float(loss_value),
-                    "batch_size": int(BATCH),
-                    "block": int(BLOCK),
-                    "dblock": bool(getattr(args, "dblock", False)),
-                    "structured_masks": bool(use_structured_masks(args)),
-                    "device": str(DEV),
-                    "save_dir": str(args.save_dir),
-                    "updated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                }
-                if DEV.type == "cuda":
-                    try:
-                        heartbeat_payload["gpu"] = {
-                            "allocated_gb": round(torch.cuda.memory_allocated() / (1024**3), 4),
-                            "reserved_gb": round(torch.cuda.memory_reserved() / (1024**3), 4),
-                            "peak_allocated_gb": round(torch.cuda.max_memory_allocated() / (1024**3), 4),
-                        }
-                    except Exception:
-                        pass
-                hb_path = pathlib.Path(args.save_dir) / "run_state.json"
-                hb_tmp = hb_path.with_suffix(".json.tmp")
-                hb_tmp.write_text(json.dumps(heartbeat_payload, sort_keys=True) + "\n")
-                hb_tmp.replace(hb_path)
-                top_path = pathlib.Path(args.save_dir).parent / "agillm43_run_state.json"
-                merged = {}
-                if top_path.exists():
-                    try:
-                        merged = json.loads(top_path.read_text())
-                    except Exception:
-                        merged = {}
-                if isinstance(merged, dict):
-                    merged.update(heartbeat_payload)
-                    merged["phase"] = "training"
-                    merged["destructive_actions_allowed"] = False
-                    top_tmp = top_path.with_suffix(".json.tmp")
-                    top_tmp.write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n")
-                    top_tmp.replace(top_path)
-            except Exception as exc:
-                print(f"[heartbeat-json] warning: {exc}", flush=True)
             print(
                 f"[heartbeat] phase={phase_name} pid={os.getpid()} step={step} "
                 f"seen_tok={seen_tok} loss={loss_value:.3f} B={BATCH} L={BLOCK} "
@@ -4821,260 +4734,11 @@ def _dblock_select_block(sigma, bsig):
     return 0 if sigma < bsig[0] else len(bsig) - 2
 
 
-def _block_stream_enabled(args) -> bool:
-    return bool(getattr(args, "block_stream", False))
-
-
-def _block_stream_compute_device(args=None):
-    return DEV
-
-
-def _moe_expert_stream_enabled(args) -> bool:
-    return bool(getattr(args, "moe_expert_stream", False))
-
-
-def _dtype_from_arg(args, attr: str, flag: str):
-    name = str(getattr(args, attr, "fp32") or "fp32").lower()
-    if name in {"fp32", "float32", "none"}:
-        return None
-    if name in {"fp16", "float16", "half"}:
-        return torch.float16
-    if name in {"bf16", "bfloat16"}:
-        return torch.bfloat16
-    raise ValueError(f"unsupported {flag} {name!r}")
-
-
-def _block_stream_dtype(args):
-    return _dtype_from_arg(args, "block_stream_dtype", "--block_stream_dtype")
-
-
-def _infer_dtype(args):
-    return _dtype_from_arg(args, "infer_dtype", "--infer_dtype")
-
-
-def _block_stream_empty_cache(args) -> bool:
-    return bool(getattr(args, "block_stream_empty_cache", True)) and torch.cuda.is_available()
-
-
-def _block_stream_kv_cache_enabled(args) -> bool:
-    return bool(getattr(args, "block_stream_kv_cache", True))
-
-
-def _block_stream_cache_pages_mode(args):
-    explicit = getattr(args, "block_stream_cache_pages", None)
-    if explicit is None:
-        return "auto"
-    return "on" if bool(explicit) else "off"
-
-
-def _block_stream_cache_pages_enabled(args) -> bool:
-    effective = getattr(args, "_block_stream_cache_pages_effective", None)
-    if effective is not None:
-        return bool(effective)
-    return _block_stream_cache_pages_mode(args) == "on"
-
-
-def _module_tensor_bytes(mod) -> int:
-    total = 0
-    for t in list(mod.parameters(recurse=True)) + list(mod.buffers(recurse=True)):
-        total += int(t.numel()) * int(t.element_size())
-    return total
-
-
-def _configure_block_stream_page_cache(args, core):
-    mode = _block_stream_cache_pages_mode(args)
-    if mode == "off":
-        args._block_stream_cache_pages_effective = False
-        args._block_stream_cache_pages_reason = "explicit-off"
-        return
-    if mode == "on":
-        args._block_stream_cache_pages_effective = True
-        args._block_stream_cache_pages_reason = "explicit-on"
-        return
-    if not torch.cuda.is_available() or DEV.type != "cuda":
-        args._block_stream_cache_pages_effective = False
-        args._block_stream_cache_pages_reason = "auto-no-cuda"
-        return
-    try:
-        device_index = DEV.index if getattr(DEV, "index", None) is not None else torch.cuda.current_device()
-        free, total = torch.cuda.mem_get_info(device_index)
-    except (TypeError, ValueError):
-        free, total = torch.cuda.mem_get_info()
-    page_bytes = sum(_module_tensor_bytes(blk) for blk in core.blocks)
-    allocated = torch.cuda.memory_allocated()
-    reserved = torch.cuda.memory_reserved()
-    reusable = max(0, int(reserved) - int(allocated))
-    usable = int(free) + int(reusable)
-    # This is an incremental fit check, not total model size. At this point the
-    # embedding, heads, CUDA context, and allocator slabs are already resident;
-    # measured page-cache peak is lower than raw block parameter bytes + safety.
-    effective_page_bytes = int(page_bytes * 0.75)
-    safety = max(128 * 1024 * 1024, int(total * 0.005))
-    effective_need = effective_page_bytes + int(safety)
-    enabled = int(usable) > int(effective_need)
-    args._block_stream_cache_pages_effective = bool(enabled)
-    args._block_stream_cache_pages_reason = (
-        f"auto usable={usable/1e9:.2f}GB free={free/1e9:.2f}GB "
-        f"reuse={reusable/1e9:.2f}GB need={effective_need/1e9:.2f}GB raw={page_bytes/1e9:.2f}GB"
-    )
-
-
-def _block_stream_kv_store_device(args):
-    name = str(getattr(args, "block_stream_kv_device", "cuda") or "cuda").lower()
-    if name in {"cuda", "gpu"} and torch.cuda.is_available():
-        return DEV
-    return torch.device("cpu")
-
-
-def _block_stream_kv_to_device(kv, device):
-    if kv is None or isinstance(kv, KVBuffer):
-        return kv
-    k, v = kv
-    if k.device == device and v.device == device:
-        return kv
-    return (k.to(device, non_blocking=True), v.to(device, non_blocking=True))
-
-
-def _block_stream_kv_to_store(kv, device):
-    if kv is None or isinstance(kv, KVBuffer):
-        return kv
-    k, v = kv
-    if device.type == "cpu":
-        return (k.detach().to("cpu", non_blocking=True), v.detach().to("cpu", non_blocking=True))
-    return (k.detach(), v.detach())
-
-
-def _block_stream_layer_pages(core, args):
-    page_layers = int(getattr(args, "block_stream_page_layers", 1) or 0)
-    if page_layers <= 0:
-        return _dblock_block_layers(core, int(getattr(args, "dblock_blocks", 4) or 4))
-    page_layers = max(1, page_layers)
-    return [list(range(i, min(i + page_layers, len(core.blocks)))) for i in range(0, len(core.blocks), page_layers)]
-
-
-def _block_stream_release(mod, args):
-    mod.to("cpu")
-    if _block_stream_empty_cache(args):
-        torch.cuda.empty_cache()
-
-
-def _block_stream_load_block(block, device, args):
-    if _moe_expert_stream_enabled(args) and isinstance(getattr(block, "ff", None), MoEFFN):
-        block.ln1.to(device)
-        block.ln2.to(device)
-        block.mha.to(device)
-        block.ff.router.to(device)
-        if block.ff.shared is not None:
-            block.ff.shared.to(device)
-        for expert in block.ff.experts:
-            expert.to("cpu")
-        block.ff.set_expert_stream(True, bool(getattr(args, "moe_expert_stream_empty_cache", True)))
-        return block
-    return block.to(device)
-
-
-def _block_stream_release_block(block, args):
-    if _block_stream_cache_pages_enabled(args):
-        return
-    if isinstance(getattr(block, "ff", None), MoEFFN):
-        block.ff.set_expert_stream(False, bool(getattr(args, "moe_expert_stream_empty_cache", True)))
-    block.to("cpu")
-    if _block_stream_empty_cache(args):
-        torch.cuda.empty_cache()
-
-
-def _moe_expert_stream_stats(core):
-    loads = 0
-    tokens = 0
-    for mod in core.modules():
-        if isinstance(mod, MoEFFN):
-            st = getattr(mod, "expert_stream_stats", None) or {}
-            loads += int(st.get("loads", 0))
-            tokens += int(st.get("tokens", 0))
-    return loads, tokens
-
-
-def _moe_expert_stream_reset_stats(core):
-    for mod in core.modules():
-        if isinstance(mod, MoEFFN):
-            mod.expert_stream_stats = {"loads": 0, "tokens": 0}
-
-
-def _block_stream_maybe_anchor(core, layer_idx, x, args):
-    if core.anchor is None or layer_idx != core.anchor_position:
-        return x
-    device = _block_stream_compute_device(args)
-    core.anchor.to(device)
-    x, _ = core.anchor(x)
-    _block_stream_release(core.anchor, args)
-    return x
-
-
-@torch.no_grad()
-def _block_stream_forward(core, ids, mask, args):
-    """Run Encoder.forward while paging blocks through the compute device."""
-    device = _block_stream_compute_device(args)
-    core.emb.to(device)
-    core.ln.to(device)
-    ids = ids.to(device)
-    x = core.emb(ids)
-    for page in _block_stream_layer_pages(core, args):
-        resident = [_block_stream_load_block(core.blocks[li], device, args) for li in page]
-        try:
-            for li, blk in zip(page, resident):
-                x = _run_block(blk, x, mask, False, args)
-                x = _block_stream_maybe_anchor(core, li, x, args)
-        finally:
-            for blk in resident:
-                _block_stream_release_block(blk, args)
-    return core.ln(x)
-
-
-@torch.no_grad()
-def _block_stream_forward_cached(core, ids, mask, kv_caches, total_seq_len, args):
-    """Block-stream AR/SAT decode with KV cache.
-
-    We still page layer weights through the compute device, but avoid recomputing
-    the full prefix for every emitted token. KV tensors can stay on CUDA for speed
-    or be stored on CPU for the lowest resident VRAM.
-    """
-    device = _block_stream_compute_device(args)
-    kv_store_device = _block_stream_kv_store_device(args)
-    core.emb.to(device)
-    core.ln.to(device)
-    ids = ids.to(device)
-    x = core.emb(ids)
-    new_kvs = [None] * len(core.blocks)
-    for page in _block_stream_layer_pages(core, args):
-        resident = [_block_stream_load_block(core.blocks[li], device, args) for li in page]
-        try:
-            for li, blk in zip(page, resident):
-                kv = kv_caches[li] if kv_caches else None
-                kv = _block_stream_kv_to_device(kv, device)
-                x, kv_out = blk(x, mask, kv, use_cache=True, total_seq_len=total_seq_len)
-                x = _block_stream_maybe_anchor(core, li, x, args)
-                new_kvs[li] = _block_stream_kv_to_store(kv_out, kv_store_device)
-        finally:
-            for blk in resident:
-                _block_stream_release_block(blk, args)
-    return core.ln(x), new_kvs
-
-
 def _edm_denoise_block(core, layers, z, sigma_t, mask, args):
     cs, co, ci = _edm_pre(sigma_t)
     h = ci * z
-    if _block_stream_enabled(args):
-        device = _block_stream_compute_device(args)
-        for li in layers:
-            blk = _block_stream_load_block(core.blocks[li], device, args)
-            try:
-                h = _run_block(blk, h, mask, False, args)
-                h = _block_stream_maybe_anchor(core, li, h, args)
-            finally:
-                _block_stream_release_block(blk, args)
-    else:
-        for li in layers:
-            h = _run_block(core.blocks[li], h, mask, False, args)
+    for li in layers:
+        h = _run_block(core.blocks[li], h, mask, False, args)
     return cs * z + co * h
 
 
@@ -5141,13 +4805,6 @@ def infer(args):
         min_new = max(min_new, SAT_BLOCK)
     path = _resolve_ckpt(pathlib.Path(args.ckpt)) or pathlib.Path(args.ckpt)
     sd = torch.load(path, map_location="cpu")
-    # Inference never needs optimizer/scaler state. Drop it before model construction
-    # so block-stream runs keep CPU RAM pressure lower after checkpoint load.
-    if isinstance(sd, dict):
-        sd.pop("opt", None)
-        sd.pop("scaler", None)
-        import gc as _gc
-        _gc.collect()
     # Restore tokenizer from checkpoint if available
     if "tokenizer_json" in sd:
         try:
@@ -5192,10 +4849,6 @@ def infer(args):
         print(f"│ Checkpoint: {ckpt_name:<35s} │")
         print(f"└─────────────────────────────────────────────────┘")
     print_expansion_info(cfg, tie_weights, plain=plain_output)
-    block_stream = _block_stream_enabled(args)
-    infer_dtype = None if block_stream else _infer_dtype(args)
-    resident_dtype = (infer_dtype is not None and not block_stream)
-    core_device = torch.device("cpu") if (block_stream or resident_dtype) else DEV
     core = Encoder(
         cfg,
         tie_weights=tie_weights,
@@ -5211,12 +4864,11 @@ def infer(args):
         anchor_stride=getattr(args, "anchor_stride", DEFAULT_ANCHOR_STRIDE),
         anchor_max=getattr(args, "anchor_max", DEFAULT_ANCHOR_MAX),
         anchor_position=getattr(args, "anchor_position", DEFAULT_ANCHOR_POSITION),
-    ).to(core_device)
-    head_device = torch.device("cpu") if resident_dtype else DEV
-    ar_h = ARHead(cfg["d"], tie_weights=tie_weights, embedding_weight=core.emb.weight if tie_weights else None).to(head_device)
+    ).to(DEV)
+    ar_h = ARHead(cfg["d"], tie_weights=tie_weights, embedding_weight=core.emb.weight if tie_weights else None).to(DEV)
     sat_head_mlp = bool(sd.get("sat_head_mlp", False) or _sat_head_mlp_from_state(sd))
-    sat_h = SATHead(cfg["d"], mlp=sat_head_mlp, tie_weights=tie_weights, embedding_weight=core.emb.weight if tie_weights else None).to(head_device)
-    nat_h = NATHead(cfg["d"], tie_weights=tie_weights, embedding_weight=core.emb.weight if tie_weights else None).to(head_device) if ("nat" in sd or args.mode == "nat") else None
+    sat_h = SATHead(cfg["d"], mlp=sat_head_mlp, tie_weights=tie_weights, embedding_weight=core.emb.weight if tie_weights else None).to(DEV)
+    nat_h = NATHead(cfg["d"], tie_weights=tie_weights, embedding_weight=core.emb.weight if tie_weights else None).to(DEV) if ("nat" in sd or args.mode == "nat") else None
     core.load_state_dict(_prepare_core_state_dict_for_load(core, sd["core"]))
     ar_h.load_state_dict(sd["ar"])
     _load_infer_head_state(sat_h, sd["sat"], "SATHead")
@@ -5229,49 +4881,6 @@ def infer(args):
     sat_h.eval()
     if nat_h is not None:
         nat_h.eval()
-    if resident_dtype:
-        core.to(dtype=infer_dtype)
-        ar_h.to(dtype=infer_dtype)
-        sat_h.to(dtype=infer_dtype)
-        if nat_h is not None:
-            nat_h.to(dtype=infer_dtype)
-        core.to(DEV)
-        ar_h.to(DEV)
-        sat_h.to(DEV)
-        if nat_h is not None:
-            nat_h.to(DEV)
-        print(f"[infer] infer_dtype={str(infer_dtype).replace('torch.', '')} resident=True device={DEV}")
-    if block_stream:
-        stream_dtype = _block_stream_dtype(args)
-        if stream_dtype is not None:
-            core.to(dtype=stream_dtype)
-            ar_h.to(dtype=stream_dtype)
-            sat_h.to(dtype=stream_dtype)
-            if nat_h is not None:
-                nat_h.to(dtype=stream_dtype)
-            print(f"[infer] block_stream_dtype={str(stream_dtype).replace('torch.', '')}")
-        core.emb.to(DEV)
-        core.ln.to(DEV)
-        if core.anchor is not None:
-            core.anchor.to("cpu")
-        for blk in core.blocks:
-            blk.to("cpu")
-        if _block_stream_empty_cache(args):
-            torch.cuda.empty_cache()
-        _configure_block_stream_page_cache(args, core)
-        page_desc = "dblock" if int(getattr(args, "block_stream_page_layers", 1) or 0) <= 0 else f"{int(getattr(args, 'block_stream_page_layers', 1))} layer(s)"
-        moe_desc = " moe_expert_stream=True" if _moe_expert_stream_enabled(args) else ""
-        page_cache_reason = getattr(args, "_block_stream_cache_pages_reason", "")
-        page_cache_desc = f" page_cache={_block_stream_cache_pages_enabled(args)}"
-        if page_cache_reason:
-            page_cache_desc += f" ({page_cache_reason})"
-        if _block_stream_kv_cache_enabled(args):
-            kv_desc = f" KV cache=True kv_device={_block_stream_kv_store_device(args)}"
-        else:
-            kv_desc = " KV cache=False full-prefix recompute=True"
-        print(f"[infer] block_stream=True device={DEV} page={page_desc}{moe_desc};{page_cache_desc}{kv_desc}")
-        if _moe_expert_stream_enabled(args):
-            _moe_expert_stream_reset_stats(core)
     total_params = _count_enabled_params(core, ar_h, sat_h, nat_h)
     if total_params >= 1_000_000_000:
         param_str = f"{total_params / 1_000_000_000:.2f}B"
@@ -5295,30 +4904,15 @@ def infer(args):
         print(f"Generating ({mode_str})...")
     else:
         print(f"{Colors.INFO}Generating ({mode_str})...{Colors.RESET}")
-    if (block_stream or resident_dtype) and torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats()
     start = time.time()
     if args.mode == "ar":
         _euler = getattr(args, "sampler", "ar") == "euler"
-        block_stream_kv = block_stream and _block_stream_kv_cache_enabled(args)
-        kvs = None
-        if not _euler and block_stream_kv:
-            h, kvs = _block_stream_forward_cached(
-                core,
-                ids,
-                causal_mask(ids.size(1), structured=use_structured_masks(args)),
-                None,
-                ids.size(1),
-                args,
-            )
-        elif not _euler and not block_stream:
+        if not _euler:
             h, kvs = core(ids, causal_mask(ids.size(1), structured=use_structured_masks(args)), use_cache=True, total_seq_len=ids.size(1))
         for _ in range(args.max_new):
             if _euler:
                 h = _dblock_euler_hidden(core, ids, args)
-            elif block_stream and not block_stream_kv:
-                h = _block_stream_forward(core, ids, causal_mask(ids.size(1), structured=use_structured_masks(args)), args)
-            logits = ar_h(h)[:, -1].float()
+            logits = ar_h(h)[:, -1]
             logits = _apply_penalties(logits, ids, args.penalty_last_n, args.repetition_penalty, args.presence_penalty, args.frequency_penalty)
             logits = _suppress_eos(logits, args)
             nxt = _sample(logits, args.temperature, args.top_k, args.top_p, args.min_p, args.greedy)
@@ -5326,10 +4920,7 @@ def infer(args):
             if EOS is not None and not getattr(args, "ignore_eos", False) and int(nxt.item()) == int(EOS):
                 break
             if not _euler:
-                if block_stream_kv:
-                    h, kvs = _block_stream_forward_cached(core, ids[:, -1:], None, kvs, ids.size(1), args)
-                elif not block_stream:
-                    h, kvs = core(ids[:, -1:], None, kv_caches=kvs, use_cache=True, total_seq_len=ids.size(1))
+                h, kvs = core(ids[:, -1:], None, kv_caches=kvs, use_cache=True, total_seq_len=ids.size(1))
     elif args.mode == "nat":
         # Iterative mask-predict decode (CMLM): keep the prompt fixed and fill the
         # BLANK slots, committing confident predictions each pass. Unlike the
@@ -5363,8 +4954,8 @@ def infer(args):
         for p in range(passes):
             if not remaining:
                 break
-            h = _block_stream_forward(core, ids, None, args) if block_stream else core(ids, None)
-            logits = nat_h(h).float()
+            h = core(ids, None)
+            logits = nat_h(h)
             logits[..., BLANK] = -1e9
             conf = logits.softmax(-1).amax(-1)
             k = max(1, -(-len(remaining) // (passes - p)))
@@ -5374,36 +4965,22 @@ def infer(args):
                 ids[0, pos] = int(nxt.reshape(-1)[0])
                 remaining.discard(pos)
         if remaining:
-            h = _block_stream_forward(core, ids, None, args) if block_stream else core(ids, None)
-            logits = nat_h(h).float()
+            h = core(ids, None)
+            logits = nat_h(h)
             logits[..., BLANK] = -1e9
             for pos in sorted(remaining):
                 nxt = _nat_pick(logits[:, pos, :], ids)
                 ids[0, pos] = int(nxt.reshape(-1)[0])
     else:
         cached_len = ids.size(1)
-        block_stream_kv = block_stream and _block_stream_kv_cache_enabled(args)
-        if block_stream_kv:
-            h, kvs = _block_stream_forward_cached(
-                core,
-                ids,
-                sat_mask(ids.size(1), structured=use_structured_masks(args)),
-                None,
-                cached_len,
-                args,
-            )
-        elif block_stream:
-            h = _block_stream_forward(core, ids, sat_mask(ids.size(1), structured=use_structured_masks(args)), args)
-            kvs = None
-        else:
-            h, kvs = core(ids, sat_mask(ids.size(1), structured=use_structured_masks(args)), use_cache=True, total_seq_len=cached_len)
+        h, kvs = core(ids, sat_mask(ids.size(1), structured=use_structured_masks(args)), use_cache=True, total_seq_len=cached_len)
         h_buffer = h[:, -SAT_BLOCK:]
         added = 0
         stop = False
         
         # Align to a SAT block boundary with AR tokens before block emission.
         while ids.size(1) % SAT_BLOCK != 0 and added < args.max_new:
-            logits = ar_h(h)[:, -1].float()
+            logits = ar_h(h)[:, -1]
             logits = _apply_penalties(logits, ids, args.penalty_last_n, args.repetition_penalty, args.presence_penalty, args.frequency_penalty)
             logits = _suppress_eos(logits, args, added < min_new)
             nxt = _sample(logits, args.temperature, args.top_k, args.top_p, args.min_p, args.greedy)
@@ -5412,24 +4989,12 @@ def infer(args):
             if EOS is not None and not getattr(args, "ignore_eos", False) and int(nxt.item()) == int(EOS):
                 stop = True
                 break
-            if block_stream:
-                if block_stream_kv:
-                    h, kvs = _block_stream_forward_cached(core, nxt, None, kvs, ids.size(1), args)
-                    cached_len = ids.size(1)
-                    h_buffer = torch.cat([h_buffer, h], dim=1)[:, -SAT_BLOCK:]
-                else:
-                    h = _block_stream_forward(core, ids, sat_mask(ids.size(1), structured=use_structured_masks(args)), args)
-                    h_buffer = h[:, -SAT_BLOCK:]
-            else:
-                h, kvs = core(nxt, None, kv_caches=kvs, use_cache=True, total_seq_len=ids.size(1))
-                cached_len = ids.size(1)
-                h_buffer = torch.cat([h_buffer, h], dim=1)[:, -SAT_BLOCK:]
+            h, kvs = core(nxt, None, kv_caches=kvs, use_cache=True, total_seq_len=ids.size(1))
+            cached_len = ids.size(1)
+            h_buffer = torch.cat([h_buffer, h], dim=1)[:, -SAT_BLOCK:]
             
         while added < args.max_new and not stop:
             logits_all, gate = sat_h(h_buffer)
-            logits_all = logits_all.float()
-            if gate is not None:
-                gate = gate.float()
             stride = SAT_BLOCK if (not args.var or gate is None) else (gate.softmax(-1).multinomial(1).item() + 1)
             stride = min(int(stride), logits_all.size(1))
             new_tokens = []
@@ -5452,31 +5017,13 @@ def infer(args):
                 if added >= args.max_new: break
             if stop or added >= args.max_new: break
             new_ids = torch.cat(new_tokens, dim=1)
-            if block_stream:
-                if block_stream_kv:
-                    mask = sat_mask_cached(new_ids.size(1), cached_len, structured=use_structured_masks(args))
-                    h, kvs = _block_stream_forward_cached(core, new_ids, mask, kvs, ids.size(1), args)
-                    cached_len = ids.size(1)
-                    h_buffer = torch.cat([h_buffer, h], dim=1)[:, -SAT_BLOCK:]
-                else:
-                    h = _block_stream_forward(core, ids, sat_mask(ids.size(1), structured=use_structured_masks(args)), args)
-                    h_buffer = h[:, -SAT_BLOCK:]
-            else:
-                mask = sat_mask_cached(new_ids.size(1), cached_len, structured=use_structured_masks(args))
-                h, kvs = core(new_ids, mask, kv_caches=kvs, use_cache=True, total_seq_len=ids.size(1))
-                cached_len = ids.size(1)
-                h_buffer = torch.cat([h_buffer, h], dim=1)[:, -SAT_BLOCK:]
+            mask = sat_mask_cached(new_ids.size(1), cached_len, structured=use_structured_masks(args))
+            h, kvs = core(new_ids, mask, kv_caches=kvs, use_cache=True, total_seq_len=ids.size(1))
+            cached_len = ids.size(1)
+            h_buffer = torch.cat([h_buffer, h], dim=1)[:, -SAT_BLOCK:]
     elapsed = time.time() - start
     gen_tokens = len(ids[0]) - prompt_len
     tok_per_sec = gen_tokens / elapsed if elapsed > 0 else 0
-    if (block_stream or resident_dtype) and torch.cuda.is_available():
-        peak_alloc_gb = torch.cuda.max_memory_allocated() / 1e9
-        peak_reserved_gb = torch.cuda.max_memory_reserved() / 1e9
-        label = "block_stream" if block_stream else "resident"
-        print(f"[infer] {label}_cuda_peak_alloc={peak_alloc_gb:.2f}GB peak_reserved={peak_reserved_gb:.2f}GB")
-        if block_stream and _moe_expert_stream_enabled(args):
-            loads, tokens = _moe_expert_stream_stats(core)
-            print(f"[infer] moe_expert_stream_loads={loads} routed_tokens={tokens}")
     all_tokens = ids[0].tolist()
     prompt_text = tok.decode(all_tokens[:prompt_len], skip_special_tokens=True)
     gen_text = tok.decode(all_tokens[prompt_len:], skip_special_tokens=True)
@@ -5671,7 +5218,7 @@ def _agillm43_prune_save_dir(save_dir):
         except Exception:
             pass
     ckpts = sorted(d.glob("pretrain_step*.pt"), key=lambda x: x.stat().st_mtime, reverse=True)
-    for old in ckpts[1:]:
+    for old in ckpts[2:]:
         try:
             old.unlink()
         except Exception:
@@ -5823,8 +5370,8 @@ def _agillm43_train_argv(save_dir, side_dir, resume_delta, profile="normal", war
         "--loss_spike_skip", "3.0", "--sat_every", prof["sat_every"], "--nat_every", prof["nat_every"],
         "--nat_max_tokens", "768", "--nat_mask_ratio", "0.5", "--token_param_ratio", "55",
         "--val_tokens", "32768", "--val_every_sec", "3600", "--val_source", "json:/workspace/agillm_math_numeracy_synth/train.jsonl", "--data_seed", "-1",
-        "--save_dir", str(save_dir), "--save_every_sec", "14400", "--heartbeat_every_sec", "300",
-        "--empty_cache_every_steps", "0", "--delta_every_steps", "25000", "--delta_max_keep", "1", "--max_ckpts", "1",
+        "--save_dir", str(save_dir), "--save_every_sec", "3600", "--heartbeat_every_sec", "300",
+        "--empty_cache_every_steps", "0", "--delta_every_steps", "25000", "--delta_max_keep", "1", "--max_ckpts", "2",
         "--async_update_dir", incoming, "--async_update_every_steps", "100", "--async_update_alpha", "0.05",
         "--async_update_max_per_check", "2", "--async_update_max_age_sec", "86400",
         "--async_update_accepted_dir", accepted, "--async_update_rejected_dir", rejected,
@@ -6220,26 +5767,6 @@ def main():
     inf.add_argument("--nat_passes", type=int, default=1)
     inf.add_argument("--ignore_eos", action="store_true",
                      help="Never stop on (or sample) EOS: suppress its logit and emit exactly max_new tokens. For base-model / SAT-head testing.")
-    inf.add_argument("--infer_dtype", choices=["fp32", "fp16", "bf16"], default="fp32",
-                     help="Resident inference dtype. fp16/bf16 load on CPU, convert, then move the model to CUDA to avoid fp32 VRAM spikes.")
-    inf.add_argument("--block_stream", action="store_true",
-                     help="VRAM-saving inference: keep heads/embeddings resident and page Encoder blocks through the compute device.")
-    inf.add_argument("--block_stream_page_layers", type=int, default=1,
-                     help="Layers per resident page for --block_stream. 1=lowest VRAM; 0=use --dblock_blocks pages.")
-    inf.add_argument("--block_stream_empty_cache", action=argparse.BooleanOptionalAction, default=True,
-                     help="Call torch.cuda.empty_cache() after each streamed page unload.")
-    inf.add_argument("--block_stream_dtype", choices=["fp32", "fp16", "bf16"], default="fp32",
-                     help="Weight/activation dtype for --block_stream. fp16 halves CPU->GPU transfer bytes on CUDA-capable cards.")
-    inf.add_argument("--block_stream_kv_cache", action=argparse.BooleanOptionalAction, default=True,
-                     help="Use KV cache for AR/SAT --block_stream decode instead of recomputing the full prefix each token.")
-    inf.add_argument("--block_stream_kv_device", choices=["cuda", "cpu"], default="cuda",
-                     help="Where --block_stream keeps KV cache tensors. cuda is faster; cpu minimizes resident VRAM.")
-    inf.add_argument("--block_stream_cache_pages", action=argparse.BooleanOptionalAction, default=None,
-                     help="Auto by default: keep streamed layer pages resident when VRAM allows. Use --no-block_stream_cache_pages for strict low-VRAM streaming.")
-    inf.add_argument("--moe_expert_stream", action="store_true",
-                     help="With --block_stream, keep routed MoE experts on CPU and page only selected experts through the compute device.")
-    inf.add_argument("--moe_expert_stream_empty_cache", action=argparse.BooleanOptionalAction, default=True,
-                     help="Call torch.cuda.empty_cache() after unloading each streamed MoE expert.")
     sup = sub.add_parser("supervise", help="Native AGILLM4.3 trainer supervisor")
     sup.add_argument("--save_dir", default="/workspace/agillm4_4090_ckpts")
     sup.add_argument("--side_dir", default="/workspace/agillm41_side_updates")

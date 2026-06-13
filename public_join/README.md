@@ -1,38 +1,40 @@
-# AGILLM4.3 Public Join Layer
+# AGILLM4.1 Public Join Layer
 
 This folder has two public network modes:
 
-- join Scott's AGILLM4.3 network as an untrusted outbound-only helper;
-- start your own signed-lease network for your own AGILLM4.3 run.
+- join Scott's AGILLM4.1 network as an untrusted outbound-only helper;
+- start your own signed-lease network for your own AGILLM4.1 run.
 
-The public coordinator for Scott's network is published here. Private SSH
-routes, backend hostnames, checkpoint paths, merge scripts, validator policy,
-and secrets still stay out of the public repo.
+The public repository intentionally does **not** contain Scott's live
+coordinator URL, join code, private SSH details, checkpoint paths, or validator
+policy. Scott has to publish the public URL, and optionally a join code, in a
+pinned issue, Discord post, web page, or direct message.
 
 ## Join Scott's Network
 
-Published coordinator:
+You need Scott's public coordinator URL. Scott may also publish a join code, but
+the join code is optional. It is an abuse-control gate, not the security model.
 
-- `AGILLM41_COORDINATOR_URL`: `https://join.opentransformers.online`
-- Health check: `https://join.opentransformers.online/health`
-- `AGILLM41_JOIN_CODE`: optional. Current public mode does not require one; use it only if Scott says the coordinator is gated.
+- `AGILLM41_COORDINATOR_URL`: the public HTTPS endpoint, for example
+  `https://join.example.com`.
+- `AGILLM41_JOIN_CODE`: optional. Use it only if Scott says the current
+  coordinator requires one.
 
-The join code is an abuse-control gate, not the security model. The real trust boundary is outbound-only workers, short-lived leases, SHA-256 artifact checks, quarantine, and trusted validation before merge.
+Do not guess the coordinator URL. A random domain in this README is only an
+example.
 
 ### What A Helper Runs
-
-By default the worker runs `--device auto`: it detects CUDA, then DirectML, else CPU, sizes threads to your machine, and reports a hardware profile (GPU name, VRAM, cores, RAM) to the coordinator. Pass `--device cuda`, `--device directml`, or `--device cpu` to force one.
 
 Linux/macOS:
 
 ```bash
-git clone https://github.com/Marxist-Leninist/AGILLM4.3.git
-cd AGILLM4.3
+git clone https://github.com/Marxist-Leninist/AGILLM4.1.git
+cd AGILLM4.1
 python -m venv .venv
 . .venv/bin/activate
 python -m pip install --upgrade pip torch
 
-export AGILLM41_COORDINATOR_URL="https://join.opentransformers.online"
+export AGILLM41_COORDINATOR_URL="https://join.example.com"
 
 python public_join/agillm41_join_worker.py \
   --coordinator-url "$AGILLM41_COORDINATOR_URL" \
@@ -52,13 +54,13 @@ and pass `--join-code "$AGILLM41_JOIN_CODE"`.
 Windows PowerShell:
 
 ```powershell
-git clone https://github.com/Marxist-Leninist/AGILLM4.3.git
-cd AGILLM4.3
+git clone https://github.com/Marxist-Leninist/AGILLM4.1.git
+cd AGILLM4.1
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip torch
 
-$env:AGILLM41_COORDINATOR_URL = "https://join.opentransformers.online"
+$env:AGILLM41_COORDINATOR_URL = "https://join.example.com"
 
 .\public_join\join_scotts_network.example.ps1 -Device cpu -Threads 2
 ```
@@ -90,36 +92,15 @@ The coordinator decides whether a quarantined result is accepted. Public helper
 updates must never be merged into `master.pt` or a live checkpoint without a
 separate validator.
 
+### What Scott Must Publish
 
-### Operator Promotion Into A Trusted Trainer
-
-Validation and promotion are intentionally separate steps. The validator only
-moves metadata to `accepted/` after checking an untrusted upload with
-`torch.load(..., weights_only=True)`, finite tensors, size limits, and norm
-limits. To let a trusted trainer ingest one accepted public result, an operator
-can then run:
-
-```bash
-python public_join/agillm41_promote_accepted.py \
-  --spool /root/agillm41_public_join/spool \
-  --out-dir /root/agillm41_worker/updates \
-  --lease-id <accepted-lease-id>
-```
-
-The promoter re-checks the result SHA-256, loads with `weights_only=True`,
-normalizes the wrapper kind to `agillm41_dblock_slice_update`, preserves public
-join audit metadata inside the update, and writes the `.pt` atomically. Do not
-run promotion as a blind loop for untrusted volunteers; keep validation policy,
-rate limits, and merge cadence under trusted operator control.
-
-### Published Join Details
+For people to actually join Scott's network, Scott needs to publish:
 
 ```text
-Coordinator URL: https://join.opentransformers.online
-Health: https://join.opentransformers.online/health
+Coordinator URL: https://join.<scotts-domain>
 Join code: optional; only needed if the coordinator is running in gated mode
 Recommended command:
-  python public_join/agillm41_join_worker.py --coordinator-url https://join.opentransformers.online --device cpu --threads 2 --loop
+  python public_join/agillm41_join_worker.py --coordinator-url ... --device cpu --threads 2 --loop
 ```
 
 Everything else stays private: SSH keys, Vast/Hetzner hostnames, checkpoint
@@ -160,12 +141,12 @@ python public_join/agillm41_network_host.py serve \
 Use a join code to reduce random internet spam, result-flooding, disk fill,
 and bandwidth waste. Do not treat it as a trust boundary.
 
-If you own a domain, point a DNS record such as `join.opentransformers.online` at the
+If you own a domain, point a DNS record such as `join.example.com` at the
 coordinator host, open TCP 443, and put a TLS reverse proxy in front of the
 Python service. Caddy is the shortest path:
 
 ```caddyfile
-join.opentransformers.online {
+join.example.com {
   reverse_proxy 127.0.0.1:8787
 }
 ```
@@ -176,7 +157,7 @@ Then run the coordinator bound to localhost:
 python public_join/agillm41_network_host.py serve \
   --host 127.0.0.1 \
   --port 8787 \
-  --public-base-url https://join.opentransformers.online \
+  --public-base-url https://join.example.com \
   --join-code-file ./join_code.txt \
   --allow-http
 ```
@@ -185,7 +166,7 @@ python public_join/agillm41_network_host.py serve \
 talks to the coordinator over local loopback only. Do not bind public HTTP to
 the internet.
 
-Add an AGILLM4.3 side-worker lease:
+Add an AGILLM4.1 side-worker lease:
 
 ```bash
 python public_join/agillm41_network_host.py add-lease \
@@ -245,32 +226,3 @@ python public_join/agillm41_join_worker.py \
   --join-code test-code \
   --device cpu
 ```
-
-
-## Contribution Points
-
-Helping train earns **contribution points**, and points will be redeemable for
-**distributed inference of the latest model** (the reason to contribute is that
-you get to use what you help build).
-
-- The worker auto-generates a stable `participant_id` on first run and persists
-  it in `<workdir>/participant_id.txt` (override with `--participant-id` or
-  `AGILLM41_PARTICIPANT_ID`). It is an opaque token, not personal information.
-- Every accepted contribution prints a `{"event": "points", ...}` line so you
-  can watch your balance grow.
-- Points are credited **only after server-side validation** of your submitted
-  update (finite values, bounded norm, structural sanity). Invalid or junk
-  uploads earn nothing. Validation loads untrusted tensors with
-  `weights_only=True` only - it never executes uploaded pickles.
-
-### Check your balance / the network
-
-```bash
-curl https://join.opentransformers.online/api/v1/points/<your-participant-id>
-curl https://join.opentransformers.online/api/v1/leaderboard
-curl https://join.opentransformers.online/api/v1/stats
-```
-
-Earning rate is currently `10` points per accepted contribution plus a small
-per-token bonus; redemption pricing for inference is published when the inference
-endpoint goes live.
