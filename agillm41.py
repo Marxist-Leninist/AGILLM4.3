@@ -285,6 +285,170 @@ def _edm_w(s, wmax=5.0):
     return float(((s**2 + SD**2) / (s * SD) ** 2).clamp(max=wmax).mean())
 
 
+class _DblockLearnedRouter(nn.Module):
+    def __init__(self, feature_dim=10, hidden=32, heads=4, layers=1):
+        super().__init__()
+        hidden = max(8, int(hidden))
+        heads = max(1, int(heads))
+        if hidden % heads != 0:
+            heads = 1
+        self.in_proj = nn.Linear(feature_dim, hidden)
+        enc = nn.TransformerEncoderLayer(
+            d_model=hidden, nhead=heads, dim_feedforward=max(16, hidden * 2),
+            dropout=0.0, activation="gelu", batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(enc, num_layers=max(1, int(layers)))
+        self.out = nn.Linear(hidden, 1)
+
+    def forward(self, x):
+        return self.out(self.encoder(self.in_proj(x))).squeeze(-1)
+
+
+def _dblock_router_mode(args):
+    return str(getattr(args, "dblock_router", "heuristic") or "heuristic").lower()
+
+
+def _dblock_router_enabled(args):
+    return _dblock_router_mode(args) in {"transformer", "learned", "neural"}
+
+
+def _dblock_router_boot(state, args):
+    if not _dblock_router_enabled(args):
+        return
+    hidden = int(getattr(args, "dblock_router_hidden", 32) or 32)
+    heads = int(getattr(args, "dblock_router_heads", 4) or 4)
+    layers = int(getattr(args, "dblock_router_layers", 1) or 1)
+    lr = float(getattr(args, "dblock_router_lr", 0.002) or 0.002)
+    router = _DblockLearnedRouter(10, hidden, heads, layers).to("cpu")
+    state["router"] = router
+    state["router_opt"] = torch.optim.AdamW(router.parameters(), lr=lr, weight_decay=1e-3)
+    state["router_target_ema"] = None
+    state["router_target_abs_ema"] = None
+    state["router_train_loss"] = None
+    state["router_last"] = None
+    print(
+        f"[dblock] learned_router=transformer hidden={hidden} heads={heads} layers={layers} lr={lr:g} "
+        f"blend={float(getattr(args, 'dblock_router_blend', 0.35)):.2f} "
+        f"ramp_steps={int(getattr(args, 'dblock_router_ramp_steps', 256) or 0)}",
+        flush=True,
+    )
+
+
+def _dblock_router_features(state, args):
+    B = int(state["B"])
+    step = int(state.get("step", 0))
+    counts = list(state.get("counts", [0 for _ in range(B)]))
+    if len(counts) != B:
+        counts = [0 for _ in range(B)]
+    emas = list(state.get("loss_ema", [None for _ in range(B)]))
+    if len(emas) != B:
+        emas = [None for _ in range(B)]
+    last_seen = list(state.get("last_seen", [-1 for _ in range(B)]))
+    if len(last_seen) != B:
+        last_seen = [-1 for _ in range(B)]
+    bsig = list(state.get("bsig", _block_sigmas(B)))
+    max_count = max(1, max(counts) if counts else 1)
+    known = [float(x) for x in emas if x is not None and math.isfinite(float(x))]
+    center = sum(known) / len(known) if known else 0.0
+    scale = (sum((x - center) ** 2 for x in known) / len(known)) ** 0.5 if len(known) > 1 else max(1.0, abs(center) * 0.05)
+    scale = max(1e-3, scale)
+    stale = [step - last_seen[i] if last_seen[i] >= 0 else step + 1 for i in range(B)]
+    max_stale = int(getattr(args, "dblock_max_stale_steps", 64) or 0)
+    stale_denom = float(max(1, max_stale if max_stale > 0 else max(stale) if stale else 1))
+    logs = [math.log(max(1e-9, float(x))) for x in bsig]
+    log_min = min(logs) if logs else 0.0
+    log_span = max(1e-6, (max(logs) - log_min) if logs else 1.0)
+    step_norm = min(1.0, math.log1p(max(0, step)) / math.log1p(10000.0))
+    feats = []
+    for i in range(B):
+        ema = emas[i]
+        known_flag = 1.0 if ema is not None and math.isfinite(float(ema)) else 0.0
+        loss_z = 0.0 if not known_flag else max(-5.0, min(5.0, (float(ema) - center) / scale))
+        lo = logs[min(i, len(logs) - 1)] if logs else 0.0
+        hi = logs[min(i + 1, len(logs) - 1)] if logs else lo
+        feats.append([
+            loss_z, known_flag, float(counts[i]) / float(max_count),
+            max(0.0, float(max_count - counts[i]) / float(max_count)),
+            min(1.0, max(0.0, float(stale[i]) / stale_denom)),
+            float(i) / float(max(1, B - 1)), (lo - log_min) / log_span,
+            (hi - log_min) / log_span, step_norm, 1.0,
+        ])
+    return torch.tensor([feats], dtype=torch.float32)
+
+
+def _dblock_router_norm(xs):
+    vals = [0.0 if not math.isfinite(float(x)) else float(x) for x in xs]
+    if not vals:
+        return vals
+    mean = sum(vals) / len(vals)
+    scale = max(1e-6, (sum((x - mean) ** 2 for x in vals) / len(vals)) ** 0.5)
+    return [(x - mean) / scale for x in vals]
+
+
+def _dblock_router_choose(state, args, heuristic_scores):
+    state["router_last"] = None
+    if not _dblock_router_enabled(args):
+        return None
+    router = state.get("router")
+    if router is None:
+        return None
+    B = int(state["B"])
+    step = int(state.get("step", 0))
+    warmup = int(getattr(args, "dblock_warmup_steps", max(8, B * 2)))
+    ramp_steps = int(getattr(args, "dblock_router_ramp_steps", 256) or 0)
+    blend_base = max(0.0, min(1.0, float(getattr(args, "dblock_router_blend", 0.35) or 0.0)))
+    if step < warmup or blend_base <= 0.0:
+        return None
+    ramp = 1.0 if ramp_steps <= 0 else min(1.0, max(0.0, float(step - warmup) / float(ramp_steps)))
+    blend = blend_base * ramp
+    if blend <= 1e-6:
+        return None
+    with torch.no_grad():
+        router.eval()
+        pred = router(_dblock_router_features(state, args))[0].detach().cpu().tolist()
+    h = _dblock_router_norm(heuristic_scores)
+    q = _dblock_router_norm(pred)
+    if len(h) != B or len(q) != B:
+        return None
+    counts = state.get("counts", [0 for _ in range(B)])
+    combined = [(1.0 - blend) * h[i] + blend * q[i] for i in range(B)]
+    choice = max(range(B), key=lambda i: (combined[i], -counts[i], -i))
+    state["router_last"] = {"mode": "transformer", "choice": int(choice), "blend": float(blend), "pred": [float(x) for x in pred]}
+    return choice
+
+
+def _dblock_router_update(state, args, bi, loss_value):
+    if not _dblock_router_enabled(args):
+        return
+    router, opt = state.get("router"), state.get("router_opt")
+    if router is None or opt is None:
+        return
+    try:
+        loss_float = float(loss_value)
+    except Exception:
+        return
+    if not math.isfinite(loss_float):
+        return
+    baseline = state.get("router_target_ema")
+    scale = state.get("router_target_abs_ema")
+    if baseline is None or not math.isfinite(float(baseline)):
+        baseline = loss_float
+    if scale is None or not math.isfinite(float(scale)) or float(scale) < 1e-3:
+        scale = max(1.0, abs(loss_float) * 0.05)
+    target_val = max(-5.0, min(5.0, (loss_float - float(baseline)) / max(1e-3, float(scale))))
+    router.train()
+    pred = router(_dblock_router_features(state, args))[0, int(bi)]
+    fit_loss = F.smooth_l1_loss(pred, pred.detach().new_tensor(target_val))
+    opt.zero_grad(set_to_none=True)
+    fit_loss.backward()
+    nn.utils.clip_grad_norm_(router.parameters(), 1.0)
+    opt.step()
+    diff = abs(loss_float - float(baseline))
+    state["router_target_ema"] = 0.98 * float(baseline) + 0.02 * loss_float
+    state["router_target_abs_ema"] = 0.98 * float(scale) + 0.02 * max(1e-3, diff)
+    state["router_train_loss"] = float(fit_loss.detach().cpu())
+
+
 def _dblock_init(core, args):
     B = int(getattr(args, "dblock_blocks", 4))
     L = len(core.blocks)
@@ -300,7 +464,7 @@ def _dblock_init(core, args):
         f"max_skew={float(getattr(args, 'dblock_max_count_skew', 1.35)):.2f} "
         f"max_stale_steps={int(getattr(args, 'dblock_max_stale_steps', 64))}"
     )
-    return {
+    state = {
         "B": B,
         "assign": asg,
         "bsig": bsig,
@@ -309,6 +473,8 @@ def _dblock_init(core, args):
         "loss_ema": [None for _ in range(B)],
         "last_seen": [-1 for _ in range(B)],
     }
+    _dblock_router_boot(state, args)
+    return state
 
 
 def _choose_block(state, args):
@@ -324,6 +490,7 @@ def _choose_block(state, args):
     last_seen = state.setdefault("last_seen", [-1 for _ in range(B)])
     if len(last_seen) != B:
         last_seen[:] = [-1 for _ in range(B)]
+    state["router_last"] = None
     if schedule == "random":
         return random.randrange(B)
     if schedule == "roundrobin":
@@ -363,7 +530,10 @@ def _choose_block(state, args):
         undertrain_score = undertrain_bonus * max(0.0, (max_count - counts[i]) / count_denom)
         return (loss_score + stale_score + undertrain_score, -counts[i], stale[i], -i)
 
-    return max(range(B), key=score)
+    heuristic_scores = [float(score(i)[0]) for i in range(B)]
+    heuristic_choice = max(range(B), key=score)
+    learned_choice = _dblock_router_choose(state, args, heuristic_scores)
+    return heuristic_choice if learned_choice is None else learned_choice
 
 
 def _sample_sigma(ids, lo, hi, args, state):
@@ -416,6 +586,13 @@ def _maybe_log(
         raw_part += f" raw_sum={float(raw_total):.3f}"
     if edm_weight is not None:
         raw_part += f" edm_w={float(edm_weight):.3f}"
+    route = state.get("router_last")
+    if isinstance(route, dict):
+        pred = ",".join(f"{float(x):.2f}" for x in route.get("pred", []))
+        raw_part += f" router={route.get('mode', 'none')} blend={float(route.get('blend', 0.0)):.2f} pred=[{pred}]"
+    rloss = state.get("router_train_loss")
+    if rloss is not None:
+        raw_part += f" router_fit={float(rloss):.3f}"
     print(
         f"[dblock] step={step} block={bi} obj={objective or 'mixed'} layers={layers} "
         f"loss={display:.3f} weighted={total_val:.3f} ar={ar_val:.3f} sat={sat_val:.3f} nat={nat_val:.3f}"
@@ -424,7 +601,9 @@ def _maybe_log(
     )
 
 
-def _update_stats(state, bi, loss_value):
+def _update_stats(state, bi, loss_value, args=None):
+    if args is not None:
+        _dblock_router_update(state, args, bi, loss_value)
     B = state["B"]
     counts = state.setdefault("counts", [0 for _ in range(B)])
     emas = state.setdefault("loss_ema", [None for _ in range(B)])
@@ -694,7 +873,7 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
         print(f"[dblock] non-finite loss {total_val}; skipped optimizer step", flush=True)
         _profile_toc(state, "step_total", _step_t)
         _profile_step_done(state, args)
-        _update_stats(state, bi, total_val)
+        _update_stats(state, bi, total_val, args)
         return total_val
 
     _spike_k = float(getattr(args, "loss_spike_skip", 0.0))
@@ -707,7 +886,7 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
             print(f"[dblock] loss spike raw_avg={raw_avg_val:.2f} > {_spike_k}x EMA={_ema:.2f}; skipped optimizer step", flush=True)
             _profile_toc(state, "step_total", _step_t)
             _profile_step_done(state, args)
-            _update_stats(state, bi, total_val)
+            _update_stats(state, bi, total_val, args)
             return total_val
         if math.isfinite(raw_avg_val):
             state["spike_ema"] = raw_avg_val if _ema is None else (0.98 * _ema + 0.02 * raw_avg_val)
@@ -727,7 +906,7 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
         peak_reserved = torch.cuda.max_memory_reserved() / (1024**3)
     _profile_toc(state, "step_total", _step_t)
     _profile_step_done(state, args)
-    _update_stats(state, bi, total_val)
+    _update_stats(state, bi, total_val, args)
     _maybe_log(
         state,
         args,
@@ -5859,6 +6038,7 @@ def _agillm43_train_argv(save_dir, side_dir, resume_delta, profile="normal", war
         "--preset", "agillm4_floor", "--tie_kv", "--resume_delta", resume_delta,
         *(["--warmstart_from", str(warmstart_from)] if warmstart_from else []),
         "--dblock", "--dblock_blocks", "4", "--dblock_schedule", "loss_balanced",
+        "--dblock_router", "transformer", "--dblock_router_blend", "0.35", "--dblock_router_ramp_steps", "256",
         "--dblock_warmup_steps", "16", "--dblock_sigma_curriculum_steps", "2000",
         "--dblock_log_every", "25", "--dblock_objective_mode", "stochastic",
         "--dblock_ar_prob", prof["ar_prob"], "--dblock_sat_prob", prof["sat_prob"], "--dblock_nat_prob", prof["nat_prob"],
@@ -6172,6 +6352,20 @@ def main():
     tr.add_argument("--dblock_blocks", type=int, default=4, help="Partition layers into this many DiffusionBlocks blocks.")
     tr.add_argument("--dblock_schedule", choices=["random", "roundrobin", "loss_balanced"], default="loss_balanced",
                     help="How --dblock chooses the next layer block. loss_balanced focuses blocks whose EMA loss is highest after warmup.")
+    tr.add_argument("--dblock_router", choices=["heuristic", "transformer"], default="heuristic",
+                    help="Optional learned transformer scheduler for DBlock layer-band selection; coverage guards still enforce fairness.")
+    tr.add_argument("--dblock_router_hidden", type=int, default=32,
+                    help="Hidden width for the tiny transformer DBlock router.")
+    tr.add_argument("--dblock_router_heads", type=int, default=4,
+                    help="Attention heads for the tiny transformer DBlock router.")
+    tr.add_argument("--dblock_router_layers", type=int, default=1,
+                    help="Transformer encoder layers for the tiny DBlock router.")
+    tr.add_argument("--dblock_router_lr", type=float, default=0.002,
+                    help="Online learning rate for the tiny transformer DBlock router.")
+    tr.add_argument("--dblock_router_blend", type=float, default=0.35,
+                    help="Max blend of learned-router score into heuristic DBlock score after ramp-up.")
+    tr.add_argument("--dblock_router_ramp_steps", type=int, default=256,
+                    help="DBlock steps over which the learned router ramps from 0 to --dblock_router_blend.")
     tr.add_argument("--dblock_warmup_steps", type=int, default=16,
                     help="Initial DBlock steps spent covering every block before loss-balanced scheduling.")
     tr.add_argument("--dblock_explore", type=float, default=0.08,
