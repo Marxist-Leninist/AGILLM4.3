@@ -1,0 +1,23 @@
+{
+  "checkpoint_uploading_to_huggingface": true,
+  "created_at_utc": "2026-06-14T04:01:27.174130+00:00",
+  "latest_status_checkpoint_name": "pretrain_step01732387.pt",
+  "latest_status_checkpoint_step": 1732387,
+  "latest_status_upload_at": "2026-06-14T04:01:15Z",
+  "latest_uploaded_full_checkpoint": {
+    "name": "20260614T035815Z_pretrain_step01732387.pt",
+    "remote_path": "training/agillm43_shared/checkpoints/full/20260614T035815Z_pretrain_step01732387.pt",
+    "sha256": "e434dd1ed4fe97c70895824ae0613533082c5f908342c148bbd493a981abea43",
+    "size": 7341896647,
+    "uploaded_at": "2026-06-14T03:59:02Z"
+  },
+  "prefix": "training/agillm43_shared",
+  "receipt_id": "20260614T040127Z",
+  "repo": "OpenTransformer/AGILLM-4.3",
+  "uploader_guard": {
+    "loop_timeout_seconds": 7200,
+    "per_file_timeout_seconds": 1800,
+    "why": "Prevents a hung Hugging Face upload call from freezing checkpoint publishing indefinitely."
+  },
+  "verification": "Hugging Face repo file list contained the latest full checkpoint and checksum after repair."
+}
