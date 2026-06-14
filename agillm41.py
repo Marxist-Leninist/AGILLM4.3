@@ -295,6 +295,11 @@ def _dblock_init(core, args):
     schedule = getattr(args, "dblock_schedule", "loss_balanced")
     print(f"[dblock] DiffusionBlocks mode: {L} layers -> {B} blocks {asg}")
     print(f"[dblock] schedule={schedule} sigma boundaries: {[round(x, 3) for x in bsig]}")
+    print(
+        f"[dblock] coverage_guard explore={float(getattr(args, 'dblock_explore', 0.05)):.3f} "
+        f"max_skew={float(getattr(args, 'dblock_max_count_skew', 1.35)):.2f} "
+        f"max_stale_steps={int(getattr(args, 'dblock_max_stale_steps', 64))}"
+    )
     return {
         "B": B,
         "assign": asg,
@@ -302,6 +307,7 @@ def _dblock_init(core, args):
         "step": 0,
         "counts": [0 for _ in range(B)],
         "loss_ema": [None for _ in range(B)],
+        "last_seen": [-1 for _ in range(B)],
     }
 
 
@@ -310,18 +316,54 @@ def _choose_block(state, args):
     schedule = str(getattr(args, "dblock_schedule", "loss_balanced") or "loss_balanced").lower()
     step = int(state.get("step", 0))
     counts = state.setdefault("counts", [0 for _ in range(B)])
+    if len(counts) != B:
+        counts[:] = [0 for _ in range(B)]
     emas = state.setdefault("loss_ema", [None for _ in range(B)])
+    if len(emas) != B:
+        emas[:] = [None for _ in range(B)]
+    last_seen = state.setdefault("last_seen", [-1 for _ in range(B)])
+    if len(last_seen) != B:
+        last_seen[:] = [-1 for _ in range(B)]
     if schedule == "random":
         return random.randrange(B)
     if schedule == "roundrobin":
         return step % B
-    explore = float(getattr(args, "dblock_explore", 0.05))
+
+    explore = max(0.0, min(1.0, float(getattr(args, "dblock_explore", 0.05))))
     warmup = int(getattr(args, "dblock_warmup_steps", max(8, B * 2)))
+
+    def least_trained():
+        return min(range(B), key=lambda i: (counts[i], last_seen[i], i))
+
     if step < warmup or any(c == 0 for c in counts):
-        return min(range(B), key=lambda i: (counts[i], i))
+        return least_trained()
+
+    max_stale = int(getattr(args, "dblock_max_stale_steps", 64) or 0)
+    stale = [step - last_seen[i] if last_seen[i] >= 0 else step + 1 for i in range(B)]
+    if max_stale > 0 and max(stale) >= max_stale:
+        return max(range(B), key=lambda i: (stale[i], -counts[i], -i))
+
+    max_count = max(counts) if counts else 0
+    min_count = min(counts) if counts else 0
+    max_skew = float(getattr(args, "dblock_max_count_skew", 1.35) or 0.0)
+    if max_skew > 1.0 and min_count > 0 and (max_count / max(1, min_count)) > max_skew:
+        return least_trained()
+
     if explore > 0.0 and random.random() < explore:
-        return min(range(B), key=lambda i: (counts[i], i))
-    return max(range(B), key=lambda i: (-1.0 if emas[i] is None else emas[i], -counts[i]))
+        return least_trained()
+
+    stale_bonus = float(getattr(args, "dblock_stale_bonus", 0.35) or 0.0)
+    undertrain_bonus = float(getattr(args, "dblock_undertrain_bonus", 0.25) or 0.0)
+    stale_denom = float(max(1, max_stale if max_stale > 0 else max(stale) if stale else 1))
+    count_denom = float(max(1, max_count))
+
+    def score(i):
+        loss_score = -1.0 if emas[i] is None else float(emas[i])
+        stale_score = stale_bonus * min(1.0, max(0.0, stale[i] / stale_denom))
+        undertrain_score = undertrain_bonus * max(0.0, (max_count - counts[i]) / count_denom)
+        return (loss_score + stale_score + undertrain_score, -counts[i], stale[i], -i)
+
+    return max(range(B), key=score)
 
 
 def _sample_sigma(ids, lo, hi, args, state):
@@ -360,8 +402,11 @@ def _maybe_log(
     step = int(state.get("step", 0))
     if log_every <= 0 or step % log_every != 0:
         return
-    counts = ",".join(str(x) for x in state.get("counts", []))
+    counts_list = state.get("counts", [])
+    last_seen = state.get("last_seen", [-1 for _ in counts_list])
+    counts = ",".join(str(x) for x in counts_list)
     emas = ",".join("nan" if x is None else f"{x:.2f}" for x in state.get("loss_ema", []))
+    stale = ",".join(str(max(0, step - int(last_seen[i]))) for i in range(min(len(counts_list), len(last_seen))))
     mem = ""
     if peak_alloc is not None:
         mem = f" peak_alloc={peak_alloc:.2f}GB peak_reserved={peak_reserved:.2f}GB"
@@ -374,7 +419,7 @@ def _maybe_log(
     print(
         f"[dblock] step={step} block={bi} obj={objective or 'mixed'} layers={layers} "
         f"loss={display:.3f} weighted={total_val:.3f} ar={ar_val:.3f} sat={sat_val:.3f} nat={nat_val:.3f}"
-        f"{raw_part} counts=[{counts}] ema=[{emas}]{mem}",
+        f"{raw_part} counts=[{counts}] ema=[{emas}] stale=[{stale}]{mem}",
         flush=True,
     )
 
@@ -383,7 +428,11 @@ def _update_stats(state, bi, loss_value):
     B = state["B"]
     counts = state.setdefault("counts", [0 for _ in range(B)])
     emas = state.setdefault("loss_ema", [None for _ in range(B)])
+    last_seen = state.setdefault("last_seen", [-1 for _ in range(B)])
+    if len(last_seen) != B:
+        last_seen[:] = [-1 for _ in range(B)]
     counts[bi] += 1
+    last_seen[bi] = int(state.get("step", 0))
     prev = emas[bi]
     beta = 0.96
     emas[bi] = float(loss_value) if prev is None else beta * float(prev) + (1.0 - beta) * float(loss_value)
@@ -5809,14 +5858,14 @@ def _agillm43_train_argv(save_dir, side_dir, resume_delta, profile="normal", war
         sys.executable, "-u", script, "train",
         "--preset", "agillm4_floor", "--tie_kv", "--resume_delta", resume_delta,
         *(["--warmstart_from", str(warmstart_from)] if warmstart_from else []),
-        "--dblock", "--dblock_blocks", "4", "--dblock_schedule", "loss_balanced",
+        "--dblock", "--dblock_blocks", "2", "--dblock_schedule", "loss_balanced",
         "--dblock_warmup_steps", "16", "--dblock_sigma_curriculum_steps", "2000",
         "--dblock_log_every", "25", "--dblock_objective_mode", "stochastic",
         "--dblock_ar_prob", prof["ar_prob"], "--dblock_sat_prob", prof["sat_prob"], "--dblock_nat_prob", prof["nat_prob"],
         "--dblock_ar_loss_tokens", prof["ar_loss_tokens"], "--dblock_sat_loss_tokens", prof["sat_loss_tokens"], "--dblock_nat_loss_tokens", prof["nat_loss_tokens"],
         "--moe_ffn", "--moe_experts", "2", "--moe_top_k", "1", "--moe_mlp_mult", "4",
         "--moe_shared_experts", "1", "--moe_shared_mlp_mult", "2", "--moe_aux_coef", "0.01", "--moe_z_coef", "0.001",
-        "--tie_weights", "--batch_size", "16", "--block", "1536", "--amp", "--attn_backend", "sdpa",
+        "--tie_weights", "--batch_size", "10", "--block", "1536", "--amp", "--attn_backend", "sdpa",
         "--sublinear_window", "128", "--sublinear_stride", "128", "--sublinear_max_anchors", "128", "--sublinear_chunk", "128",
         "--sublinear_sinks", "4", "--sublinear_recent_anchors", "64", "--no-sublinear_pooled_landmarks",
         "--dblock_checkpoint_stride", "1", "--optimizer", "adamw8bit",
@@ -6125,8 +6174,16 @@ def main():
                     help="How --dblock chooses the next layer block. loss_balanced focuses blocks whose EMA loss is highest after warmup.")
     tr.add_argument("--dblock_warmup_steps", type=int, default=16,
                     help="Initial DBlock steps spent covering every block before loss-balanced scheduling.")
-    tr.add_argument("--dblock_explore", type=float, default=0.05,
+    tr.add_argument("--dblock_explore", type=float, default=0.08,
                     help="Exploration rate for loss-balanced DBlock scheduling.")
+    tr.add_argument("--dblock_max_stale_steps", type=int, default=64,
+                    help="Force the stalest DBlock after this many unselected DBlock steps; 0 disables.")
+    tr.add_argument("--dblock_max_count_skew", type=float, default=1.35,
+                    help="Force least-trained DBlock when max/min sampled block counts exceed this ratio; <=1 disables.")
+    tr.add_argument("--dblock_stale_bonus", type=float, default=0.35,
+                    help="Loss-score bonus for stale DBlocks before the hard stale guard triggers.")
+    tr.add_argument("--dblock_undertrain_bonus", type=float, default=0.25,
+                    help="Loss-score bonus for under-sampled DBlocks before the hard count-skew guard triggers.")
     tr.add_argument("--dblock_log_every", type=int, default=25,
                     help="Print DBlock block/loss/VRAM diagnostics every N DBlock steps; 0 disables.")
     tr.add_argument("--dblock_checkpoint_stride", type=int, default=1,
