@@ -3368,8 +3368,10 @@ class Encoder(nn.Module):
         else:
             self.anchor = None
 
-    def forward(self, ids, mask, kv_caches=None, use_cache=False, total_seq_len=None):
-        x = self.emb(ids)
+    def forward(self, ids, mask, kv_caches=None, use_cache=False, total_seq_len=None, inputs_embeds=None):
+        # SwiReasoning: latent ("silent") steps inject a continuous thought vector
+        # here instead of a discrete token embedding. inputs_embeds is [B, T, d].
+        x = self.emb(ids) if inputs_embeds is None else inputs_embeds
         if not use_cache:
             for i, blk in enumerate(self.blocks):
                 if self.grad_checkpoint and self.training:
@@ -5030,6 +5032,99 @@ def _sample(logits, T, top_k, top_p, min_p, greedy):
     if probs.sum() == 0: return logits.argmax(-1, keepdim=True)
     return probs.div_(probs.sum()).multinomial(1)
 
+
+def _swi_entropy(probs):
+    """Shannon entropy (nats) of a [B, V] distribution, averaged over batch."""
+    p = probs.clamp_min(1e-12)
+    return float(-(p * p.log()).sum(-1).mean())
+
+
+def _swi_soft_embed(core, probs, top_k):
+    """Continuous 'thought' = probability-weighted average of token embeddings.
+
+    This is what a latent step feeds back instead of a sampled token: the model's
+    next-token belief stays in superposition in hidden space rather than collapsing
+    to one discrete token. Restricting to the top-k mass keeps the thought sharp.
+    """
+    E = core.emb.weight                       # [V, d]
+    if top_k and 0 < top_k < probs.size(-1):
+        v, i = torch.topk(probs, top_k, dim=-1)          # [B, k]
+        v = v / v.sum(-1, keepdim=True).clamp_min(1e-12)
+        thought = (v.unsqueeze(-1) * E[i]).sum(1)        # [B, d]
+    else:
+        thought = probs.to(E.dtype) @ E                  # [B, d]
+    return thought.unsqueeze(1).to(E.dtype)              # [B, 1, d]
+
+
+def _swireasoning_decode(core, ar_h, ids, args, min_new):
+    """Training-free SwiReasoning decode for the AR path.
+
+    Alternates between two reasoning regimes, gated by next-token entropy:
+      • EXPLICIT — sample a real token (the model "thinks out loud").
+      • LATENT   — inject a continuous thought embedding and emit NO token, so the
+                   model reasons silently in hidden space (token-efficient).
+
+    Policy (per the SwiReasoning paper): when the next-token distribution is diffuse
+    / entropy is rising the model has low confidence, so it drops into latent space
+    to explore multiple continuations in superposition; when it becomes confident
+    (entropy low or sharply falling) it switches back to explicit to consolidate a
+    single line of thought and write it down. A switch budget (--swi_max_switches)
+    and a thinking budget (--swi_think_budget) cap overthinking; once either is
+    spent the decoder stays explicit to finish the answer. Returns the grown ids.
+    """
+    use_struct = use_structured_masks(args)
+    seq_len = ids.size(1)
+    # Prime the KV cache on the full prompt.
+    h, kvs = core(ids, causal_mask(seq_len, structured=use_struct),
+                  use_cache=True, total_seq_len=seq_len)
+    mode = "latent" if getattr(args, "swi_start_latent", False) else "explicit"
+    switches = latent_run = think_steps = emitted = 0
+    prev_H = None
+    n_latent = n_explicit = 0
+    while emitted < args.max_new and think_steps < args.swi_max_steps:
+        logits_last = ar_h(h)[:, -1].float()
+        probs_raw = (logits_last / max(args.temperature, 1e-8)).softmax(-1)
+        H = _swi_entropy(probs_raw)
+        dH = 0.0 if prev_H is None else (H - prev_H)
+        prev_H = H
+
+        thinking = think_steps < args.swi_think_budget
+        if thinking and switches < args.swi_max_switches:
+            if mode == "latent":
+                # confident now (low / sharply-falling entropy) or ran latent too long
+                if (H < args.swi_explicit_thresh or dH < -args.swi_eps
+                        or latent_run >= args.swi_max_latent):
+                    mode, switches, latent_run = "explicit", switches + 1, 0
+            else:
+                # diffuse + rising entropy -> explore silently in latent space
+                if H > args.swi_latent_thresh and dH > args.swi_eps:
+                    mode, switches = "latent", switches + 1
+        else:
+            mode = "explicit"   # budget spent / past thinking phase: finish out loud
+
+        if mode == "latent":
+            thought = _swi_soft_embed(core, probs_raw, args.swi_topk)
+            seq_len += 1; think_steps += 1; latent_run += 1; n_latent += 1
+            h, kvs = core(None, None, kv_caches=kvs, use_cache=True,
+                          total_seq_len=seq_len, inputs_embeds=thought)
+            continue
+
+        logits = _apply_penalties(logits_last, ids, args.penalty_last_n,
+                                  args.repetition_penalty, args.presence_penalty,
+                                  args.frequency_penalty)
+        logits = _suppress_eos(logits, args, emitted < min_new)
+        nxt = _sample(logits, args.temperature, args.top_k, args.top_p, args.min_p, args.greedy)
+        ids = torch.cat([ids, nxt], 1)
+        emitted += 1; think_steps += 1; n_explicit += 1
+        if EOS is not None and not getattr(args, "ignore_eos", False) and int(nxt.item()) == int(EOS):
+            break
+        seq_len += 1
+        h, kvs = core(nxt, None, kv_caches=kvs, use_cache=True, total_seq_len=seq_len)
+    saved = (n_latent / max(1, n_latent + n_explicit)) * 100.0
+    print(f"[swi] explicit={n_explicit} latent={n_latent} switches={switches} "
+          f"({saved:.0f}% of reasoning steps emitted no token)")
+    return ids
+
 def _dblock_block_layers(core, dblock_blocks):
     L = len(core.blocks)
     B = max(1, int(dblock_blocks))
@@ -5526,7 +5621,14 @@ def infer(args):
     if (block_stream or resident_dtype) and torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
     start = time.time()
-    if args.mode == "ar":
+    if args.mode == "ar" and getattr(args, "swi_reasoning", False):
+        if block_stream or getattr(args, "sampler", "ar") == "euler":
+            print("[swi] --swi_reasoning needs plain KV decode "
+                  "(no --block_stream / --sampler euler); falling back to standard AR.")
+            args.swi_reasoning = False
+    if args.mode == "ar" and getattr(args, "swi_reasoning", False):
+        ids = _swireasoning_decode(core, ar_h, ids, args, min_new)
+    elif args.mode == "ar":
         _euler = getattr(args, "sampler", "ar") == "euler"
         block_stream_kv = block_stream and _block_stream_kv_cache_enabled(args)
         kvs = None
@@ -6471,6 +6573,27 @@ def main():
     inf.add_argument("--nat_passes", type=int, default=1)
     inf.add_argument("--ignore_eos", action="store_true",
                      help="Never stop on (or sample) EOS: suppress its logit and emit exactly max_new tokens. For base-model / SAT-head testing.")
+    # ── SwiReasoning: entropy-gated switching between explicit CoT and silent latent reasoning (--mode ar only) ──
+    inf.add_argument("--swi_reasoning", action="store_true",
+                     help="Enable SwiReasoning: alternate between explicit token CoT and silent latent reasoning, gated by next-token entropy. AR mode, plain KV decode only.")
+    inf.add_argument("--swi_latent_thresh", type=float, default=2.5,
+                     help="Entropy (nats) above which, while rising, an explicit step drops into latent reasoning (low confidence -> explore silently).")
+    inf.add_argument("--swi_explicit_thresh", type=float, default=1.0,
+                     help="Entropy (nats) below which a latent step switches back to explicit (high confidence -> consolidate out loud).")
+    inf.add_argument("--swi_eps", type=float, default=0.05,
+                     help="Min entropy change (nats) to count as a confidence trend when deciding to switch.")
+    inf.add_argument("--swi_max_switches", type=int, default=8,
+                     help="Max latent<->explicit switches during the thinking phase (caps overthinking). After this, decode stays explicit.")
+    inf.add_argument("--swi_max_latent", type=int, default=16,
+                     help="Max consecutive latent (silent) steps before forcing an explicit step, so the model commits a token.")
+    inf.add_argument("--swi_think_budget", type=int, default=256,
+                     help="Reasoning steps (latent+explicit) allowed to switch; after this the decoder stays explicit to finish the answer.")
+    inf.add_argument("--swi_max_steps", type=int, default=4096,
+                     help="Hard cap on total forward steps (latent steps emit no token, so this bounds runtime when max_new is reached slowly).")
+    inf.add_argument("--swi_topk", type=int, default=20,
+                     help="Top-k token mass used to build the continuous latent thought embedding (0 = full softmax over vocab).")
+    inf.add_argument("--swi_start_latent", action="store_true",
+                     help="Begin in latent (silent) mode instead of explicit.")
     inf.add_argument("--infer_dtype", choices=["fp32", "fp16", "bf16"], default="fp32",
                      help="Resident inference dtype. fp16/bf16 load on CPU, convert, then move the model to CUDA to avoid fp32 VRAM spikes.")
     inf.add_argument("--block_stream", action="store_true",
