@@ -1,0 +1,20 @@
+{
+  "checkpoint_upload_status": "Uploader process was alive but stale at snapshot time; timeout guard/restart should be used before trusting fresh checkpoint uploads.",
+  "created_at_utc": "2026-06-14T03:54:24.606606+00:00",
+  "latest_local_checkpoint_step": 1732387,
+  "model": "AGILLM4.3",
+  "parameter_count": 1221580802,
+  "public_training_config": {
+    "attention_backend": "sdpa",
+    "batch_size": "10",
+    "context_block": "1536",
+    "dblock_blocks": "2",
+    "grad_checkpoint": false,
+    "hardware": "single RTX 4090 Vast node",
+    "moe_experts": "2",
+    "moe_shared_experts": "1",
+    "moe_top_k": "1",
+    "optimizer": "adamw8bit"
+  },
+  "snapshot_id": "20260614T035424Z"
+}
