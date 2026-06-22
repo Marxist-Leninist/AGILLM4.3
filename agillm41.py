@@ -10,12 +10,8 @@ compatibility patches:
 - DeepSeek-V3.2 legacy compatibility support through the agillm35 shim
 - AR + SAT checkpoint schema compatibility; NAT can be disabled with --agillm3_compat
 - DiffusionBlock training support and optional async side-update ingestion
-
-Single-file build date: 2026-06-21.
 """
 from __future__ import annotations
-
-AGILLM43_SINGLE_FILE_BUILD_DATE = "2026-06-21"
 
 # Single-file module alias: helper code still imports the historical module names.
 import sys as _agillm41_sys
