@@ -1,77 +1,100 @@
----
-library_name: pytorch
-tags:
-  - agillm
-  - transformer
-  - diffusion-block
-  - mixture-of-experts
-  - single-file
-license: other
+# AGILLM 4.3 — Autoregressive + DiffusionBlock + MoE Language Model
+
+**Single-file implementation:** `agillm41.py`
+**Parameters:** 1.22B (1,221,580,802)
+**Architecture:** d_model=1280, layers=28, heads=20, d_k=64, rank=160 (2.5× expansion), tied weights
+
 ---
 
-# AGILLM 4.3
+## ⚠️ CHECKPOINT PROVENANCE — READ FIRST
 
-AGILLM 4.3 is the AGILLM 4.2 warm start with shared MoE experts and DiffusionBlocks training. The compatibility runtime file is still named `agillm41.py`, but this repo tracks the 4.3 runtime and public volunteer path.
+Checkpoint filenames (e.g. `pretrain_step00050650.pt`) reflect the **step counter within the current training run**, NOT total training steps.
 
-## Public Safety Boundary
+**This model warm-started from step 2,182,564 (~2.1M steps) of a prior run.**
 
-This public repo is for inspection, local inference experiments, and untrusted volunteer helpers. It intentionally excludes trusted-core operations, private topology, watchdog launch scripts, live hot configs, SSH paths, API tokens, and checkpoint merge scripts.
+| What the filename says | What it actually means |
+|---|---|
+| `pretrain_step00050650.pt` | Current-run step 50,650 |
+| True total steps | ≈ 2,182,564 + 50,650 = **~2,233,214 steps** |
+| Tokens seen (current run) | ~4.2B / 67.2B target (6.25%) |
 
-Untrusted volunteer nodes should use only the outbound public join flow. The published coordinator is `https://join.opentransformers.online`, and its health endpoint is `https://join.opentransformers.online/health`.
+Checkpoints live in:
+```
+checkpoints/warmstart_step2182564__current_step50650/
+```
+The folder name is the canonical reference for provenance.
+
+---
+
+## Architecture
+
+| Component | Value |
+|---|---|
+| Backbone | Autoregressive transformer (AR) |
+| DiffusionBlocks | Active — layers cycle AR/SAT/NAT objectives |
+| Mixture-of-Experts | Active — 14 slots per block |
+| d_model | 1280 |
+| Layers | 28 |
+| Attention heads | 20 |
+| Tied weights | Yes |
+| Tokenizer | Llama-compatible (from checkpoint) |
+
+---
+
+## Training Fleet (as of 2026-06-24)
+
+- **FedA** (41441116): 2× V100-SXM2-32GB, `ssh2.vast.ai:11116`, $0.0593/hr
+  - a0: role=coverage, B=56, L=1536
+  - a1: role=hard-blocks, B=48, L=1536
+- **Target:** 67.2B tokens total
+- **Budget runway:** ~Jul 24, 2026
+
+---
+
+## Inference
 
 ```bash
-python public_join/agillm41_join_worker.py \
-  --coordinator-url https://join.opentransformers.online \
-  --device cpu \
-  --threads 2 \
-  --loop
+# AR mode (standard autoregressive)
+python3 agillm41.py infer \
+  --ckpt checkpoints/warmstart_step2182564__current_step50650/pretrain_step00050650.pt \
+  --prompt "Your prompt here" \
+  --mode ar --max_new 100 --plain-output --block_stream
+
+# SAT mode (score-and-threshold diffusion)
+python3 agillm41.py infer ... --mode sat
+
+# NAT mode (non-autoregressive diffusion)
+python3 agillm41.py infer ... --mode nat
 ```
 
-The worker opens outbound HTTPS only, verifies SHA-256 for lease artifacts, receives short-lived lease tokens only, and submits results to quarantine. Public helper results must be validated before they can affect a checkpoint.
+> **Note:** If both GPUs are busy with training, add `CUDA_VISIBLE_DEVICES=""` to force CPU inference (slow but functional: ~1.2 tok/s).
 
-## Files
+> **Dependency:** `agillm_checkpoint_provenance.py` must be in the same directory as `agillm41.py`.
 
-- `agillm41.py`: latest public AGILLM runtime, including AR/SAT/NAT inference and DiffusionBlocks paths.
-- `public_join/`: outbound worker, public lease coordinator, and public validation/points helpers.
-- `agillm4/training_bench/agillm4_slice_bench_worker.py`: default public slice worker for leased training packages.
-- `distributed_infer/`: public distributed inference harnesses without private launch topology.
+---
 
-## Private Counterpart
+## Current Inference Quality (step ~50,650 / ~2.23M total)
 
-Trusted-core operations live in the private repo `Marxist-Leninist/agillm4.3-private` and private HF repo `OpenTransformer/agillm4.3-private`.
+See `INFERENCE_QUALITY.md` for AR/SAT/NAT benchmark outputs at each major checkpoint.
 
-## Hugging Face
+At this training stage (6.25% of token target), output is partially coherent — the model knows structure, names, dates, and grammar patterns but has not yet converged on fluent generation. Expect significant quality improvement as training approaches 67B tokens.
 
-Public model card and checkpoint lineage: https://hf.co/OpenTransformer/AGILLM-4.3
+---
 
-## Run Your Own Federated Network
+## Repositories
 
-If you want to host your own decentralized training swarm for AGILLM models, you can run the volunteer coordinator and validation endpoints yourself.
+| Repo | Type | Notes |
+|---|---|---|
+| `Marxist-Leninist/agillm4.3-private` | GitHub private | Source of truth for code |
+| `Marxist-Leninist/AGILLM4.3` | GitHub public | Mirror |
+| `Marxist-Leninist/AGILLM4.1` | GitHub public | Mirror (same codebase) |
+| `Marxist-Leninist/agillm4.1-private` | GitHub private | Mirror |
+| `OpenTransformer/agillm4.3-private` | HuggingFace private | Code + checkpoints |
+| `OpenTransformer/AGILLM-4.3` | HuggingFace public | Code + checkpoints |
 
-1. **Start the Network Host (Coordinator):**
-   This script runs a FastHTML web server that distributes training leases to workers and receives asynchronous `.pt` gradient updates.
-   ```bash
-   python public_join/agillm41_network_host.py \
-     --host 0.0.0.0 \
-     --port 8787 \
-     --spool ./agillm41_lease_spool \
-     --public-base-url http://YOUR_IP:8787
-   ```
+---
 
-2. **Add Packages (Master Node):**
-   Your master training loop exports bench packages which are added to the spool:
-   ```bash
-   python public_join/agillm41_network_host.py add-lease \
-     --spool ./agillm41_lease_spool \
-     --package /path/to/exported_bench_pkg.pt \
-     --base-ckpt /path/to/base_model.pt
-   ```
+## For Future Claude/AI Agents
 
-3. **Validate Results:**
-   Once workers submit results to the quarantine directory in the spool, you must validate them before your master applies them.
-   ```bash
-   python public_join/agillm41_validate_and_credit.py \
-     --spool ./agillm41_lease_spool \
-     --base-ckpt /path/to/base_model.pt
-   ```
-   Validated updates will be moved to an `accepted/` directory which your master can then asynchronously merge.
+MCP memory (Silicon Goddess) slot index for AGILLM4.3 state: slots **42, 95, 481–525+**.
+Standing instruction: **always run AR + SAT + NAT inference checks before reporting training healthy.** See `INFERENCE_QUALITY.md`.
