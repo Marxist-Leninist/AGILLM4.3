@@ -5818,14 +5818,14 @@ def _side_update_move(path: pathlib.Path, directory: pathlib.Path) -> pathlib.Pa
         shutil.move(str(path), str(dest))
     return dest
 
-def _apply_async_side_updates(core: nn.Module, cfg: dict, args, step: int) -> list[dict]:
+def _apply_async_side_updates(core: nn.Module, cfg: dict, args, step: int) -> tuple[list[dict], list[dict]]:
     update_dir_s = str(getattr(args, "async_update_dir", "") or "").strip()
     alpha = float(getattr(args, "async_update_alpha", 1.0) or 0.0)
     if not update_dir_s or alpha <= 0.0:
-        return []
+        return [], []
     update_dir = pathlib.Path(update_dir_s)
     if not update_dir.exists():
-        return []
+        return [], []
     max_updates = max(1, int(getattr(args, "async_update_max_per_check", 1) or 1))
     max_age = float(getattr(args, "async_update_max_age_sec", 0.0) or 0.0)
     accepted_dir = pathlib.Path(getattr(args, "async_update_accepted_dir", "") or (update_dir.parent / "accepted"))
@@ -5834,6 +5834,7 @@ def _apply_async_side_updates(core: nn.Module, cfg: dict, args, step: int) -> li
     buffer_map = dict(core.named_buffers())
     now = time.time()
     applied: list[dict] = []
+    rejected: list[dict] = []
     candidates = sorted(
         [p for p in update_dir.glob("*.pt") if p.is_file() and not p.name.endswith(".tmp")],
         key=lambda p: p.stat().st_mtime,
@@ -5903,18 +5904,103 @@ def _apply_async_side_updates(core: nn.Module, cfg: dict, args, step: int) -> li
                 dest = _side_update_move(path, rejected_dir)
             except Exception:
                 dest = path
+            err = reject_reason or str(exc)
             print(
                 json.dumps(
                     {
                         "event": "async_side_update_rejected",
                         "step": step,
                         "path": str(dest),
-                        "error": reject_reason or str(exc),
+                        "error": err,
                     }
                 ),
                 flush=True,
             )
-    return applied
+            try:
+                upd_partial = _agillm43_load_pt(dest, map_location="cpu", weights_only=False) if dest.exists() else {}
+            except Exception:
+                upd_partial = {}
+            rejected.append({
+                "path": str(dest),
+                "worker_id": upd_partial.get("worker_id"),
+                "block_id": upd_partial.get("block_id"),
+                "layers": upd_partial.get("layers"),
+                "error": err,
+            })
+    return applied, rejected
+
+# ── HF federation dataset logging ─────────────────────────────────────────────
+_HF_FED_UPDATES_REPO = "OpenTransformer/AGILLM-4.3-fed-updates"
+_HF_FED_ROUNDS_REPO  = "OpenTransformer/AGILLM-4.3-fed-rounds"
+
+def _hf_fed_log_rows_bg(repo_id: str, rows: list, step: int) -> None:
+    """Append JSONL rows to an HF dataset repo in a fire-and-forget background thread."""
+    if not rows:
+        return
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if not token:
+        return
+    try:
+        from huggingface_hub import HfApi
+    except ImportError:
+        return
+
+    def _upload():
+        try:
+            api = HfApi(token=token)
+            ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            fname = f"data/{step:08d}-{ts}-{os.getpid()}.jsonl"
+            content = "\n".join(json.dumps(r, separators=(",", ":")) for r in rows) + "\n"
+            api.upload_file(
+                path_or_fileobj=content.encode(),
+                path_in_repo=fname,
+                repo_id=repo_id,
+                repo_type="dataset",
+                commit_message=f"fed log step {step}",
+            )
+        except Exception as exc:
+            print(f"[hf-fed-log] {repo_id} upload failed: {exc}", flush=True)
+
+    threading.Thread(target=_upload, daemon=True).start()
+
+
+def _hf_fed_log_side_updates(applied: list, rejected: list, step: int) -> None:
+    """Log accepted/rejected side-updates to HF AGILLM-4.3-fed-updates."""
+    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    rows = []
+    for rec in applied:
+        rows.append({
+            "ts_utc": ts, "step": step, "status": "accepted",
+            "worker_id": rec.get("worker_id"), "block_id": rec.get("block_id"),
+            "layers": rec.get("layers"), "tokens": rec.get("tokens"),
+            "tok_per_sec": rec.get("tok_per_sec"), "alpha": rec.get("alpha"),
+            "keys": rec.get("keys"), "update_mode": rec.get("update_mode"),
+            "block_codec": rec.get("block_codec"),
+        })
+    for rec in rejected:
+        rows.append({
+            "ts_utc": ts, "step": step, "status": "rejected",
+            "worker_id": rec.get("worker_id"), "block_id": rec.get("block_id"),
+            "layers": rec.get("layers"), "tokens": None,
+            "tok_per_sec": None, "alpha": None, "keys": None,
+            "update_mode": None, "block_codec": None,
+            "error": rec.get("error"),
+        })
+    _hf_fed_log_rows_bg(_HF_FED_UPDATES_REPO, rows, step)
+
+
+def _hf_fed_log_round(step: int, seen_tok: int, loss: float, role_tag: str, origin_tag: str) -> None:
+    """Log a delta-save event (federation round boundary) to HF AGILLM-4.3-fed-rounds."""
+    row = {
+        "ts_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "step": step,
+        "seen_tok": int(seen_tok),
+        "loss": round(float(loss), 6),
+        "role_tag": role_tag,
+        "origin_tag": origin_tag,
+    }
+    _hf_fed_log_rows_bg(_HF_FED_ROUNDS_REPO, [row], step)
+# ── end HF federation dataset logging ─────────────────────────────────────────
 
 def _optimizer_param_groups(core, ar_h, sat_h, lr_core: float, lr_head: float, nat_h=None):
     # Shared/tied vocab projections must appear in only one optimizer group.
@@ -6649,7 +6735,7 @@ def _train_phase(
         pbar.update(toks_processed)
         async_every = int(getattr(args, "async_update_every_steps", 0) or 0)
         if async_every > 0 and (step % async_every) == 0:
-            _apply_async_side_updates(core, cfg, args, step)
+            _hf_fed_log_side_updates(*_apply_async_side_updates(core, cfg, args, step), step)
         empty_cache_every = int(getattr(args, "empty_cache_every_steps", 0) or 0)
         if DEV.type == "cuda" and empty_cache_every > 0 and (step % empty_cache_every) == 0:
             try:
@@ -6837,6 +6923,7 @@ def _train_phase(
             save_delta(core, ar_h, sat_h, nat_h, step, seen_tok, save_root, phase_name, getattr(args, "delta_codec", "zstd3"), provenance=_delta_prov, origin_tag=_origin_tag, dt_tag=time.strftime("_%Y%m%dT%H%MZ", time.gmtime()), role_tag=_role_tag)
             last_delta_step = step
             last_delta_mono = now_mono
+            _hf_fed_log_round(step, seen_tok, loss_value, _role_tag, _origin_tag)
         if args.auto_grow:
             steps_since_last_grow += 1
             if steps_since_last_grow >= args.grow_every_steps:
