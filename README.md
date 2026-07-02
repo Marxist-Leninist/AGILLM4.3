@@ -101,3 +101,21 @@ Standing instruction: **always run AR + SAT + NAT inference checks before report
 
 
 
+
+
+## Inference Benchmarks
+
+The following benchmarks demonstrate the inference speed across Autoregressive (AR), Semi-Autoregressive (SAT), and Non-Autoregressive (NAT) generation modes on a 128-token sequence. 
+
+**Hardware Specifications:** CPU x16 (Fair run)
+**Load Baseline:** 67.4s
+
+| Mode       | Generation Time | Speed (tok/s) |
+|------------|-----------------|---------------|
+| AR-128     | 28.1s           | 4.56          |
+| SAT-128    | 16.7s           | 7.66          |
+| NAT p4-128 | 5.1s            | 25.10         |
+| NAT p2-128 | 1.5s            | 85.33         |
+| NAT p1-128 | 1.8s            | 71.11         |
+
+*Note: The token-per-second metrics are highly dependent on the specified hardware specs (CPU x16) and will vary significantly on other hardware (e.g., GPU acceleration).*
