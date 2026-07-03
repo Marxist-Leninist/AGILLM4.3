@@ -71,6 +71,8 @@ python3 agillm41.py infer ... --mode nat
 
 > **Dependency:** `agillm_checkpoint_provenance.py` must be in the same directory as `agillm41.py`.
 
+> **Benchmark note:** Throughput numbers must be reported as tokens/sec with hardware and decode settings attached. The July 2, 2026 GETH CPU-only benchmark measured AR/SAT/NAT at 128 generated tokens on a 16-vCPU Intel Xeon Skylake KVM guest; see `docs/inference_tps_hardware_note_2026-07-02.md`.
+
 ---
 
 ## Current Inference Quality (step ~50,650 / ~2.23M total)
@@ -98,7 +100,6 @@ At this training stage (6.25% of token target), output is partially coherent —
 
 MCP memory (Silicon Goddess) slot index for AGILLM4.3 state: slots **42, 95, 481–525+**.
 Standing instruction: **always run AR + SAT + NAT inference checks before reporting training healthy.** See `INFERENCE_QUALITY.md`.
-
 
 
 
