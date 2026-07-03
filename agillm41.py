@@ -25,7 +25,7 @@ _agillm41_sys.modules.setdefault("anchor_memory", _agillm41_sys.modules[__name__
 import types as _agillm41_types
 
 # ===== BEGIN agillm_checkpoint_provenance.py (folded) =====
-_AGILLM_CHECKPOINT_PROVENANCE_SOURCE = '"""agillm_checkpoint_provenance.py — git-style lineage tracking for checkpoints.\n\nEvery full checkpoint (.pt) carries a `provenance` dict that records:\n  - warmstart source & its provenance (chained like git commits)\n  - training step, tokens seen, loss (total + per-head)\n  - training script name + SHA256, full argv\n  - creation time, hostname, PID, GPU metrics\n  - inference samples (3 short generations from the model)\n  - dataset provenance snapshot\n\nCLI usage:\n  python3 agillm_checkpoint_provenance.py show <checkpoint.pt>\n  python3 agillm_checkpoint_provenance.py lineage <checkpoint.pt>\n  python3 agillm_checkpoint_provenance.py compare <ckpt_a.pt> <ckpt_b.pt>\n"""\n\nfrom __future__ import annotations\n\nimport argparse\nimport hashlib\nimport json\nimport os\nimport platform\nimport subprocess\nimport sys\nimport time\nimport pathlib\nimport re\nfrom typing import Any, Dict, List, Optional, Tuple\n\n# ---------------------------------------------------------------------------\n# Schema key\n# ---------------------------------------------------------------------------\nPROVENANCE_KEY = "agillm43_provenance"\nPROVENANCE_SCHEMA_VERSION = 1\n\n# ---------------------------------------------------------------------------\n# Provenance dict shape\n# ---------------------------------------------------------------------------\n"""\nprovenance = {\n    "schema_version": 1,\n    "checkpoint_type": "full" | "delta",\n\n    # Identity\n    "created_at_iso": "2026-06-23T03:14:00Z",\n    "created_at_unix": 1750000000.0,\n    "hostname": "agillm43-boxa",\n    "pid": 1372905,\n    "lane": "a0",\n\n    # Training state\n    "step": 13886,\n    "seen_tok": 850000000,\n    "loss": 2.345,\n    "loss_ar": 2.1,\n    "loss_sat": 0.15,\n    "loss_nat": 0.095,\n    "batch_size": 56,\n    "block_size": 1536,\n\n    # Source\n    "train_script": "agillm41.py",\n    "train_script_sha256": "abc123...",\n    "train_argv": "--warmstart_from /workspace/... --preset agillm4_floor ...",\n\n    # Warmstart chain (like git parent)\n    "warmstart_source_path": "/workspace/agillm4_v100_master_ckpts/pretrain_step02182564.pt",\n    "warmstart_source_provenance": { ... } or None,\n\n    # Config snapshot\n    "cfg_keys": ["dmodel", "layers", "heads", ...],\n\n    # Inference samples (3 short generations)\n    "inference_samples": [\n        {"prompt": "The meaning of life is", "generation": " to find", "tokens": 5},\n        ...\n    ],\n\n    # GPU state at save time\n    "gpu": {\n        "allocated_gb": 30.5,\n        "reserved_gb": 31.2,\n        "peak_allocated_gb": 32.0,\n    },\n\n    # Dataset provenance fragment\n    "dataset_provenance": { ... },\n\n    # Tokenizer info\n    "tokenizer_id": "...",\n}\n"""\n\n\n# ---------------------------------------------------------------------------\n# Utilities\n# ---------------------------------------------------------------------------\n\ndef _iso_now() -> str:\n    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())\n\n\ndef _sha256_file(path: pathlib.Path) -> str:\n    h = hashlib.sha256()\n    with open(path, "rb") as f:\n        while True:\n            chunk = f.read(1 << 20)\n            if not chunk:\n                break\n            h.update(chunk)\n    return h.hexdigest()\n\n\ndef _sha256_bytes(data: bytes) -> str:\n    return hashlib.sha256(data).hexdigest()\n\n\ndef _gpu_metrics() -> dict:\n    """Collect GPU memory usage if CUDA is available."""\n    try:\n        import torch\n        if not torch.cuda.is_available():\n            return {}\n        return {\n            "allocated_gb": round(torch.cuda.memory_allocated() / (1024**3), 2),\n            "reserved_gb": round(torch.cuda.memory_reserved() / (1024**3), 2),\n            "peak_allocated_gb": round(torch.cuda.max_memory_allocated() / (1024**3), 2),\n        }\n    except Exception:\n        return {}\n\n\ndef _script_sha256() -> Tuple[str, str]:\n    """SHA256 of the running training script. Returns (basename, hexdigest)."""\n    try:\n        main = sys.modules.get("__main__")\n        if main and hasattr(main, "__file__") and main.__file__:\n            p = pathlib.Path(main.__file__).resolve()\n            return p.name, _sha256_file(p)\n    except Exception:\n        pass\n    return ("", "")\n\n\ndef _script_argv() -> str:\n    return " ".join(sys.argv)\n\n\ndef _infer_samples(core, ar_h, sat_h, tok, device: str, prompt_texts: List[str],\n                   max_new: int = 32, temperature: float = 0.5, top_k: int = 20) -> List[dict]:\n    """Generate a few short inference samples from the model.\n\n    This is called at save time with gradients off (torch.no_grad).\n    If anything fails, returns an empty list — never crashes a save.\n    """\n    samples = []\n    try:\n        import torch\n        core.eval()\n        ar_h.eval()\n        if sat_h is not None:\n            sat_h.eval()\n\n        for prompt in prompt_texts:\n            try:\n                input_ids = tok.encode(prompt, return_tensors="pt").to(device)\n                if input_ids.numel() == 0:\n                    continue\n                generated = input_ids.clone()\n                for _ in range(max_new):\n                    with torch.no_grad():\n                        h = core(generated, None)\n                        logits = ar_h(h[:, -1:])\n                        probs = torch.softmax(logits[:, -1] / max(temperature, 1e-8), dim=-1)\n                        if top_k > 0:\n                            vals, idxs = torch.topk(probs, min(top_k, probs.size(-1)))\n                            probs = torch.zeros_like(probs).scatter_(-1, idxs, vals)\n                        next_id = torch.multinomial(probs, 1)\n                    generated = torch.cat([generated, next_id], dim=1)\n                    if next_id.item() == 0:  # EOS\n                        break\n                text = tok.decode(generated[0].tolist(), skip_special_tokens=True)\n                new_tokens = generated.size(1) - input_ids.size(1)\n                samples.append({\n                    "prompt": prompt,\n                    "generation": text[len(prompt):] if text.startswith(prompt) else text,\n                    "tokens": new_tokens,\n                })\n            except Exception:\n                samples.append({"prompt": prompt, "generation": "", "tokens": 0})\n    except Exception:\n        pass\n    return samples\n\n\n# ---------------------------------------------------------------------------\n# Core provenance construction\n# ---------------------------------------------------------------------------\n\ndef _step_from_text(text: Optional[str]) -> Optional[int]:\n    m = re.search(r"step(\\d+)", str(text or ""))\n    return int(m.group(1)) if m else None\n\n\ndef _origin_step_from_provenance(prov: Optional[dict]) -> int:\n    if not isinstance(prov, dict):\n        return 0\n    for key in ("global_origin_step", "warmstart_base_step"):\n        try:\n            value = int(prov.get(key) or 0)\n        except Exception:\n            value = 0\n        if value > 0:\n            return value\n    parent = prov.get("warmstart_source_path") or prov.get("source_path") or ""\n    parent_step = _step_from_text(parent)\n    if parent_step and parent_step >= 1_000_000:\n        return int(parent_step)\n    return 0\n\n\ndef _origin_seen_tok_from_provenance(prov: Optional[dict]) -> int:\n    if not isinstance(prov, dict):\n        return 0\n    for key in ("global_origin_seen_tok", "warmstart_base_seen_tok"):\n        try:\n            value = int(prov.get(key) or 0)\n        except Exception:\n            value = 0\n        if value > 0:\n            return value\n    return 0\n\n\ndef collect(args, *, step: int, seen_tok: int, loss: float,\n             loss_ar: Optional[float] = None, loss_sat: Optional[float] = None,\n             loss_nat: Optional[float] = None,\n             batch_size: int = 0, block_size: int = 0,\n             warmstart_source_path: Optional[str] = None,\n             warmstart_source_provenance: Optional[dict] = None,\n             dataset_provenance: Optional[dict] = None,\n             lane: str = "",\n             inference_samples: Optional[list] = None,\n             checkpoint_type: str = "full",\n             _sample_core=None, _sample_ar=None, _sample_sat=None,\n             _sample_tok=None, _sample_device: str = "",\n             _sample_prompts: Optional[List[str]] = None) -> dict:\n    """Build a provenance dict to embed in the checkpoint."""\n\n    script_name, script_sha = _script_sha256()\n\n    prov: dict = {\n        "schema_version": PROVENANCE_SCHEMA_VERSION,\n        "checkpoint_type": checkpoint_type,\n        "created_at_iso": _iso_now(),\n        "created_at_unix": time.time(),\n        "hostname": platform.node(),\n        "pid": os.getpid(),\n        "lane": lane or "",\n        "step": int(step),\n        "seen_tok": int(seen_tok),\n        "loss": float(loss),\n        "batch_size": int(batch_size),\n        "block_size": int(block_size),\n        "train_script": script_name,\n        "train_argv": _script_argv(),\n        "gpu": _gpu_metrics(),\n    }\n\n    if script_sha:\n        prov["train_script_sha256"] = script_sha\n\n    if loss_ar is not None:\n        prov["loss_ar"] = float(loss_ar)\n    if loss_sat is not None:\n        prov["loss_sat"] = float(loss_sat)\n    if loss_nat is not None:\n        prov["loss_nat"] = float(loss_nat)\n\n    source_step = _step_from_text(warmstart_source_path)\n    origin_step = _origin_step_from_provenance(warmstart_source_provenance)\n    origin_seen_tok = _origin_seen_tok_from_provenance(warmstart_source_provenance)\n    if not origin_step and source_step and source_step >= 1_000_000:\n        origin_step = int(source_step)\n\n    prov["local_step"] = int(step)\n    if source_step is not None:\n        prov["warmstart_source_step"] = int(source_step)\n    prov["global_origin_step"] = int(origin_step or 0)\n    prov["warmstart_base_step"] = int(origin_step or 0)\n    prov["effective_global_step"] = int((origin_step + int(step)) if origin_step else int(step))\n    prov["global_origin_seen_tok"] = int(origin_seen_tok or 0)\n    prov["warmstart_base_seen_tok"] = int(origin_seen_tok or 0)\n    prov["effective_seen_tok"] = int(int(origin_seen_tok or 0) + int(seen_tok))\n\n    if warmstart_source_path:\n        prov["warmstart_source_path"] = str(warmstart_source_path)\n        if warmstart_source_provenance:\n            prov["warmstart_source_provenance"] = warmstart_source_provenance\n\n    if dataset_provenance:\n        prov["dataset_provenance"] = dataset_provenance\n\n    if inference_samples is not None:\n        prov["inference_samples"] = inference_samples\n    elif _sample_core is not None and _sample_ar is not None and _sample_tok is not None:\n        try:\n            prompts = _sample_prompts or ["The meaning of", "def hello():", "2 + 2 ="]\n            prov["inference_samples"] = _infer_samples(\n                _sample_core, _sample_ar, _sample_sat,\n                _sample_tok, _sample_device or "cpu", prompts, max_new=12)\n        except Exception:\n            prov["inference_samples"] = []\n\n    return prov\n\n\ndef embed(state_dict: dict, provenance: dict) -> dict:\n    """Embed provenance into the checkpoint state dict (mutates + returns)."""\n    state_dict[PROVENANCE_KEY] = provenance\n    return state_dict\n\n\n# ---------------------------------------------------------------------------\n# Extraction (lightweight — only reads provenance from .pt wrapper)\n# ---------------------------------------------------------------------------\n\ndef extract(path: pathlib.Path) -> Optional[dict]:\n    """Extract the provenance dict from a saved .pt checkpoint.\n\n    This reads only the top-level wrapper, not the full model weights.\n    For zstd-wrapped checkpoints, it only decompresses enough to find the\n    provenance key.\n\n    Returns None if no provenance is found.\n    """\n    try:\n        import torch\n        # The checkpoint may be zstd-wrapped. Load the wrapper first.\n        wrapper = torch.load(str(path), map_location="cpu", weights_only=False)\n        if not isinstance(wrapper, dict):\n            return None\n\n        # If zstd-wrapped, decompress and get inner dict\n        inner = wrapper\n        if wrapper.get("__agillm43_payload_codec__") == "agillm43_zstd_torch_v1":\n            import zstandard as zstd\n            raw = zstd.ZstdDecompressor().decompress(bytes(wrapper["payload"].tolist()))\n            import io\n            inner = torch.load(io.BytesIO(raw), map_location="cpu", weights_only=False)\n\n        if not isinstance(inner, dict):\n            return None\n\n        provenance = inner.get(PROVENANCE_KEY)\n        if provenance is not None:\n            return provenance\n\n        # Fallback: check for sidecar\n        sidecar = path.with_suffix(".provenance.json")\n        if sidecar.exists():\n            return json.loads(sidecar.read_text())\n\n        return None\n    except Exception:\n        return None\n\n\ndef extract_provenance_sidecar(ckpt_path: pathlib.Path) -> Optional[dict]:\n    """Read the .provenance.json sidecar without touching the .pt at all."""\n    sidecar = ckpt_path.with_suffix(".provenance.json")\n    if sidecar.exists():\n        try:\n            return json.loads(sidecar.read_text())\n        except Exception:\n            pass\n    return None\n\n\ndef write_sidecar(ckpt_path: pathlib.Path, provenance: dict) -> None:\n    """Write .provenance.json sidecar beside the checkpoint."""\n    sidecar = ckpt_path.with_suffix(".provenance.json")\n    tmp = sidecar.with_suffix(".provenance.json.tmp")\n    try:\n        tmp.write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\\n")\n        tmp.replace(sidecar)\n    except Exception as exc:\n        print(f"[provenance] WARNING: failed to write sidecar {sidecar}: {exc}")\n\n\n# ---------------------------------------------------------------------------\n# Display / CLI\n# ---------------------------------------------------------------------------\n\ndef format_provenance(prov: dict, indent: int = 0) -> str:\n    """Format a provenance dict as a readable block."""\n    pad = "  " * indent\n    lines = [f"{pad}┌── Checkpoint Provenance ──"]\n    if not prov:\n        return f"{pad}└── (no provenance)"\n\n    def kv(k, v, default="—"):\n        val = v if v is not None else default\n        return f"{pad}  {k}: {val}"\n\n    lines.append(kv("Schema version", prov.get("schema_version")))\n    lines.append(kv("Type", prov.get("checkpoint_type")))\n    lines.append(kv("Step", prov.get("step")))\n    lines.append(kv("Tokens seen", f"{prov.get(\'seen_tok\', 0):,}"))\n    lines.append(kv("Loss", prov.get("loss")))\n    if prov.get("loss_ar") is not None:\n        lines.append(kv("  ├ AR loss", prov["loss_ar"]))\n    if prov.get("loss_sat") is not None:\n        lines.append(kv("  ├ SAT loss", prov["loss_sat"]))\n    if prov.get("loss_nat") is not None:\n        lines.append(kv("  └ NAT loss", prov["loss_nat"]))\n    lines.append(kv("Batch / Block", f"{prov.get(\'batch_size\')} / {prov.get(\'block_size\')}"))\n    lines.append(kv("Created (ISO)", prov.get("created_at_iso")))\n    lines.append(kv("Hostname", prov.get("hostname")))\n    lines.append(kv("PID", prov.get("pid")))\n    lines.append(kv("Lane", prov.get("lane", "—")))\n    lines.append(kv("Train script", prov.get("train_script")))\n    if prov.get("train_script_sha256"):\n        lines.append(kv("  └ SHA256", prov["train_script_sha256"][:16] + "..."))\n    gpu = prov.get("gpu", {})\n    if gpu:\n        lines.append(kv("GPU alloc/resrv/peak",\n                        f"{gpu.get(\'allocated_gb\', \'?\')}G / {gpu.get(\'reserved_gb\', \'?\')}G / {gpu.get(\'peak_allocated_gb\', \'?\')}G"))\n\n    ws = prov.get("warmstart_source_path")\n    if ws:\n        lines.append(kv("Warmstart source", ws))\n        wprov = prov.get("warmstart_source_provenance")\n        if wprov:\n            lines.append(f"{pad}  └ step={wprov.get(\'step\', \'?\')} loss={wprov.get(\'loss\', \'?\')}")\n\n    samples = prov.get("inference_samples", [])\n    if samples:\n        lines.append(f"{pad}Inference samples ({len(samples)}):")\n        for i, s in enumerate(samples):\n            gen = s.get("generation", "")\n            if len(gen) > 60:\n                gen = gen[:60] + "..."\n            lines.append(f"{pad}  [{i}] prompt={s.get(\'prompt\',\'\')!r}")\n            lines.append(f"{pad}      → {gen!r} ({s.get(\'tokens\', 0)} tokens)")\n\n    lines.append(f"{pad}└──")\n    return "\\n".join(lines)\n\n\ndef show_lineage(path: pathlib.Path, max_depth: int = 32) -> List[dict]:\n    """Walk the provenance chain (like git log) and return ordered list [oldest..newest]."""\n    chain: List[dict] = []\n    seen = set()\n    current = path.resolve() if path.exists() else path\n\n    for _ in range(max_depth):\n        prov = extract(current)\n        if prov is None:\n            break\n\n        key = str(current)\n        if key in seen:\n            break\n        seen.add(key)\n\n        entry = prov.copy()\n        entry["_checkpoint_path"] = str(current)\n        chain.append(entry)\n\n        # Walk to warmstart parent\n        ws = prov.get("warmstart_source_path")\n        if not ws:\n            break\n        wprov = prov.get("warmstart_source_provenance")\n        if not wprov:\n            break\n        current = pathlib.Path(ws)\n        # Avoid infinite loop if parent points to itself\n        if str(current) == key:\n            break\n    else:\n        chain.append({"_checkpoint_path": f"(truncated at {max_depth} hops)"})\n\n    chain.reverse()  # oldest first\n    return chain\n\n\ndef format_lineage(chain: List[dict]) -> str:\n    """Format a lineage chain as a readable tree."""\n    lines = ["Checkpoint Lineage (oldest → newest):", ""]\n    for i, entry in enumerate(chain):\n        path = entry.get("_checkpoint_path", "?")\n        step = entry.get("step", "?")\n        loss = entry.get("loss", "?")\n        iso = entry.get("created_at_iso", "?")\n        ws = entry.get("warmstart_source_path", "")\n        marker = "●" if i == len(chain) - 1 else "│" if i < len(chain) - 1 else "○"\n        lines.append(f"  {marker}  step={step}  loss={loss}  {iso}")\n        lines.append(f"  │   {path}")\n        if ws and i < len(chain) - 1:\n            lines.append(f"  │   warmstart ← {pathlib.Path(ws).name}")\n        lines.append("")\n    return "\\n".join(lines)\n\n\n# ---------------------------------------------------------------------------\n# CLI\n# ---------------------------------------------------------------------------\n\ndef _cmd_show(args_cli):\n    path = pathlib.Path(args_cli.checkpoint)\n    if not path.exists():\n        print(f"ERROR: {path} not found")\n        sys.exit(1)\n    prov = extract(path)\n    if prov is None:\n        prov = extract_provenance_sidecar(path)\n    if prov is None:\n        print(f"No provenance found in {path}")\n        sys.exit(1)\n    print(format_provenance(prov))\n    if args_cli.verbose:\n        print("\\nFull provenance JSON:")\n        print(json.dumps(prov, indent=2, sort_keys=True))\n\n\ndef _cmd_lineage(args_cli):\n    path = pathlib.Path(args_cli.checkpoint)\n    if not path.exists():\n        print(f"ERROR: {path} not found")\n        sys.exit(1)\n    chain = show_lineage(path, max_depth=args_cli.max_depth)\n    print(format_lineage(chain))\n\n\ndef _cmd_compare(args_cli):\n    a = pathlib.Path(args_cli.checkpoint_a)\n    b = pathlib.Path(args_cli.checkpoint_b)\n    for p, label in [(a, "A"), (b, "B")]:\n        if not p.exists():\n            print(f"ERROR: {label}={p} not found")\n            sys.exit(1)\n\n    pa = extract(a) or {}\n    pb = extract(b) or {}\n\n    def safe(key, d, default="—"):\n        return d.get(key, default)\n\n    print(f"Compare: {a.name}  vs  {b.name}")\n    print()\n    keys = ["step", "seen_tok", "loss", "loss_ar", "loss_sat", "loss_nat",\n            "batch_size", "block_size", "created_at_iso", "hostname", "lane"]\n    for k in keys:\n        va = safe(k, pa)\n        vb = safe(k, pb)\n        changed = " ←" if str(va) != str(vb) else ""\n        print(f"  {k:20s}  {str(va):>20s}  {str(vb):>20s}{changed}")\n\n    sa = pa.get("inference_samples", [])\n    sb = pb.get("inference_samples", [])\n    if sa or sb:\n        print()\n        print(f"  Inference samples: A={len(sa)}  B={len(sb)}")\n\n\ndef main():\n    parser = argparse.ArgumentParser(\n        description="agillm checkpoint provenance — git for checkpoints",\n        formatter_class=argparse.RawDescriptionHelpFormatter,\n        epilog=__doc__,\n    )\n    sub = parser.add_subparsers(dest="command")\n\n    p_show = sub.add_parser("show", help="Show provenance for a checkpoint")\n    p_show.add_argument("checkpoint", type=str, help="Path to .pt checkpoint")\n    p_show.add_argument("-v", "--verbose", action="store_true", help="Also dump full JSON")\n\n    p_lineage = sub.add_parser("lineage", help="Show full warmstart chain (git log)")\n    p_lineage.add_argument("checkpoint", type=str, help="Path to .pt checkpoint")\n    p_lineage.add_argument("--max-depth", type=int, default=32, help="Max hops to follow")\n\n    p_cmp = sub.add_parser("compare", help="Compare two checkpoints")\n    p_cmp.add_argument("checkpoint_a", type=str)\n    p_cmp.add_argument("checkpoint_b", type=str)\n\n    args_cli = parser.parse_args()\n    if args_cli.command == "show":\n        _cmd_show(args_cli)\n    elif args_cli.command == "lineage":\n        _cmd_lineage(args_cli)\n    elif args_cli.command == "compare":\n        _cmd_compare(args_cli)\n    else:\n        parser.print_help()\n        sys.exit(1)\n\n\nif __name__ == "__main__":\n    main()\n'
+_AGILLM_CHECKPOINT_PROVENANCE_SOURCE = '"""agillm_checkpoint_provenance.py — git-style lineage tracking for checkpoints.\n\nEvery full checkpoint (.pt) carries a `provenance` dict that records:\n  - warmstart source & its provenance (chained like git commits)\n  - training step, tokens seen, loss (total + per-head)\n  - training script name + SHA256, full argv\n  - creation time, hostname, PID, GPU metrics\n  - inference samples (3 short generations from the model)\n  - dataset provenance snapshot\n\nCLI usage:\n  python3 agillm_checkpoint_provenance.py show <checkpoint.pt>\n  python3 agillm_checkpoint_provenance.py lineage <checkpoint.pt>\n  python3 agillm_checkpoint_provenance.py compare <ckpt_a.pt> <ckpt_b.pt>\n"""\n\nfrom __future__ import annotations\n\nimport argparse\nimport hashlib\nimport json\nimport os\nimport platform\nimport re\nimport subprocess\nimport sys\nimport time\nimport pathlib\nfrom typing import Any, Dict, List, Optional, Tuple\n\n# ---------------------------------------------------------------------------\n# Schema key\n# ---------------------------------------------------------------------------\nPROVENANCE_KEY = "agillm43_provenance"\nPROVENANCE_SCHEMA_VERSION = 1\n\n# ---------------------------------------------------------------------------\n# Provenance dict shape\n# ---------------------------------------------------------------------------\n"""\nprovenance = {\n    "schema_version": 1,\n    "checkpoint_type": "full" | "delta",\n\n    # Identity\n    "created_at_iso": "2026-06-23T03:14:00Z",\n    "created_at_unix": 1750000000.0,\n    "hostname": "agillm43-boxa",\n    "pid": 1372905,\n    "lane": "a0",\n\n    # Training state\n    "step": 13886,\n    "seen_tok": 850000000,\n    "loss": 2.345,\n    "loss_ar": 2.1,\n    "loss_sat": 0.15,\n    "loss_nat": 0.095,\n    "batch_size": 56,\n    "block_size": 1536,\n\n    # Source\n    "train_script": "agillm41.py",\n    "train_script_sha256": "abc123...",\n    "train_argv": "--warmstart_from /workspace/... --preset agillm4_floor ...",\n\n    # Warmstart chain (like git parent)\n    "warmstart_source_path": "/workspace/agillm4_v100_master_ckpts/pretrain_step02182564.pt",\n    "warmstart_source_provenance": { ... } or None,\n\n    # Config snapshot\n    "cfg_keys": ["dmodel", "layers", "heads", ...],\n\n    # Inference samples (3 short generations)\n    "inference_samples": [\n        {"prompt": "The meaning of life is", "generation": " to find", "tokens": 5},\n        ...\n    ],\n\n    # GPU state at save time\n    "gpu": {\n        "allocated_gb": 30.5,\n        "reserved_gb": 31.2,\n        "peak_allocated_gb": 32.0,\n    },\n\n    # Dataset provenance fragment\n    "dataset_provenance": { ... },\n\n    # Tokenizer info\n    "tokenizer_id": "...",\n}\n"""\n\n\n# ---------------------------------------------------------------------------\n# Utilities\n# ---------------------------------------------------------------------------\n\ndef _iso_now() -> str:\n    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())\n\n\ndef _sha256_file(path: pathlib.Path) -> str:\n    h = hashlib.sha256()\n    with open(path, "rb") as f:\n        while True:\n            chunk = f.read(1 << 20)\n            if not chunk:\n                break\n            h.update(chunk)\n    return h.hexdigest()\n\n\ndef _sha256_bytes(data: bytes) -> str:\n    return hashlib.sha256(data).hexdigest()\n\n\ndef _gpu_metrics() -> dict:\n    """Collect GPU memory usage if CUDA is available."""\n    try:\n        import torch\n        if not torch.cuda.is_available():\n            return {}\n        return {\n            "allocated_gb": round(torch.cuda.memory_allocated() / (1024**3), 2),\n            "reserved_gb": round(torch.cuda.memory_reserved() / (1024**3), 2),\n            "peak_allocated_gb": round(torch.cuda.max_memory_allocated() / (1024**3), 2),\n        }\n    except Exception:\n        return {}\n\n\ndef _script_sha256() -> Tuple[str, str]:\n    """SHA256 of the running training script. Returns (basename, hexdigest)."""\n    try:\n        main = sys.modules.get("__main__")\n        if main and hasattr(main, "__file__") and main.__file__:\n            p = pathlib.Path(main.__file__).resolve()\n            return p.name, _sha256_file(p)\n    except Exception:\n        pass\n    return ("", "")\n\n\ndef _script_argv() -> str:\n    return " ".join(sys.argv)\n\n\ndef _read_proc_cmdline(pid: str = "self") -> str:\n    try:\n        raw = pathlib.Path("/proc") / str(pid) / "cmdline"\n        data = raw.read_bytes()\n        return " ".join(part.decode("utf-8", "replace") for part in data.split(b"\\0") if part)\n    except Exception:\n        return ""\n\n\ndef _safe_env_snapshot() -> dict:\n    """Capture useful launch env without leaking tokens or credentials."""\n    prefixes = ("AGILLM", "CUDA_", "HF_HUB_", "HF_DATASETS_", "PYTORCH_", "OMP_", "MKL_")\n    allow = {\n        "CUDA_VISIBLE_DEVICES",\n        "HF_HUB_DISABLE_XET",\n        "HF_DATASETS_TRUST_REMOTE_CODE",\n        "PYTORCH_CUDA_ALLOC_CONF",\n        "OMP_NUM_THREADS",\n        "MKL_NUM_THREADS",\n    }\n    secret_fragments = ("TOKEN", "SECRET", "PASSWORD", "PASSWD", "KEY", "CREDENTIAL", "AUTH", "COOKIE")\n    out = {}\n    for key, value in sorted(os.environ.items()):\n        if not (key in allow or key.startswith(prefixes)):\n            continue\n        if any(fragment in key.upper() for fragment in secret_fragments):\n            out[key] = "<redacted>"\n        else:\n            out[key] = str(value)[:2048]\n    return out\n\n\ndef _redact_text(text: str) -> str:\n    secret_fragments = ("TOKEN", "SECRET", "PASSWORD", "PASSWD", "API_KEY", "AUTH", "COOKIE")\n    lines = []\n    for line in str(text).splitlines()[:240]:\n        upper = line.upper()\n        if any(fragment in upper for fragment in secret_fragments):\n            lines.append("<redacted secret-bearing line>")\n        else:\n            lines.append(line[:4096])\n    return "\\n".join(lines)\n\n\ndef _launch_metadata() -> dict:\n    meta = {\n        "schema": "agillm.launch.v1",\n        "argv": list(sys.argv),\n        "argv_string": _script_argv(),\n        "cwd": "",\n        "pid": os.getpid(),\n        "ppid": os.getppid(),\n        "proc_cmdline": _read_proc_cmdline("self"),\n        "parent_proc_cmdline": _read_proc_cmdline(str(os.getppid())),\n        "env": _safe_env_snapshot(),\n    }\n    try:\n        meta["cwd"] = str(pathlib.Path.cwd())\n    except Exception:\n        pass\n    launch_script = os.environ.get("AGILLM43_LAUNCH_SCRIPT") or os.environ.get("AGILLM_LAUNCH_SCRIPT") or ""\n    launch_command = os.environ.get("AGILLM43_LAUNCH_COMMAND") or os.environ.get("AGILLM_LAUNCH_COMMAND") or ""\n    if launch_command:\n        meta["launch_command"] = _redact_text(launch_command)\n    if launch_script:\n        sp = pathlib.Path(launch_script)\n        info = {"path": str(sp)}\n        try:\n            if sp.exists() and sp.is_file():\n                info["size_bytes"] = sp.stat().st_size\n                info["sha256"] = _sha256_file(sp)\n                info["preview_redacted"] = _redact_text(sp.read_text(errors="replace"))\n        except Exception as exc:\n            info["error"] = str(exc)\n        meta["launch_script"] = info\n    return meta\n\n\ndef _infer_samples(core, ar_h, sat_h, tok, device: str, prompt_texts: List[str],\n                   max_new: int = 32, temperature: float = 0.5, top_k: int = 20) -> List[dict]:\n    """Generate a few short inference samples from the model.\n\n    This is called at save time with gradients off (torch.no_grad).\n    If anything fails, returns an empty list — never crashes a save.\n    """\n    samples = []\n    try:\n        import torch\n        core.eval()\n        ar_h.eval()\n        if sat_h is not None:\n            sat_h.eval()\n\n        for prompt in prompt_texts:\n            try:\n                input_ids = tok.encode(prompt, return_tensors="pt").to(device)\n                if input_ids.numel() == 0:\n                    continue\n                generated = input_ids.clone()\n                for _ in range(max_new):\n                    with torch.no_grad():\n                        h = core(generated, None)\n                        logits = ar_h(h[:, -1:])\n                        probs = torch.softmax(logits[:, -1] / max(temperature, 1e-8), dim=-1)\n                        if top_k > 0:\n                            vals, idxs = torch.topk(probs, min(top_k, probs.size(-1)))\n                            probs = torch.zeros_like(probs).scatter_(-1, idxs, vals)\n                        next_id = torch.multinomial(probs, 1)\n                    generated = torch.cat([generated, next_id], dim=1)\n                    if next_id.item() == 0:  # EOS\n                        break\n                text = tok.decode(generated[0].tolist(), skip_special_tokens=True)\n                new_tokens = generated.size(1) - input_ids.size(1)\n                samples.append({\n                    "prompt": prompt,\n                    "generation": text[len(prompt):] if text.startswith(prompt) else text,\n                    "tokens": new_tokens,\n                })\n            except Exception:\n                samples.append({"prompt": prompt, "generation": "", "tokens": 0})\n    except Exception:\n        pass\n    return samples\n\n\n# ---------------------------------------------------------------------------\n# Core provenance construction\n# ---------------------------------------------------------------------------\n\ndef _step_from_text(text: Optional[str]) -> Optional[int]:\n    m = re.search(r"step(\\d+)", str(text or ""))\n    return int(m.group(1)) if m else None\n\n\ndef _origin_step_from_provenance(prov: Optional[dict]) -> int:\n    if not isinstance(prov, dict):\n        return 0\n    for key in ("global_origin_step", "warmstart_base_step"):\n        try:\n            value = int(prov.get(key) or 0)\n        except Exception:\n            value = 0\n        if value > 0:\n            return value\n    parent = prov.get("warmstart_source_path") or prov.get("source_path") or ""\n    parent_step = _step_from_text(parent)\n    if parent_step and parent_step > 0:  # AGILLM-LINEAGE-FIX 20260702\n        return int(parent_step)\n    return 0\n\n\ndef _origin_seen_tok_from_provenance(prov: Optional[dict]) -> int:\n    if not isinstance(prov, dict):\n        return 0\n    for key in ("global_origin_seen_tok", "warmstart_base_seen_tok"):\n        try:\n            value = int(prov.get(key) or 0)\n        except Exception:\n            value = 0\n        if value > 0:\n            return value\n    return 0\n\n\ndef collect(args, *, step: int, seen_tok: int, loss: float,\n             loss_ar: Optional[float] = None, loss_sat: Optional[float] = None,\n             loss_nat: Optional[float] = None,\n             batch_size: int = 0, block_size: int = 0,\n             warmstart_source_path: Optional[str] = None,\n             warmstart_source_provenance: Optional[dict] = None,\n             dataset_provenance: Optional[dict] = None,\n             lane: str = "",\n             inference_samples: Optional[list] = None,\n             checkpoint_type: str = "full",\n             _sample_core=None, _sample_ar=None, _sample_sat=None,\n             _sample_tok=None, _sample_device: str = "",\n             _sample_prompts: Optional[List[str]] = None) -> dict:\n    """Build a provenance dict to embed in the checkpoint."""\n\n    script_name, script_sha = _script_sha256()\n\n    prov: dict = {\n        "schema_version": PROVENANCE_SCHEMA_VERSION,\n        "checkpoint_type": checkpoint_type,\n        "created_at_iso": _iso_now(),\n        "created_at_unix": time.time(),\n        "hostname": platform.node(),\n        "pid": os.getpid(),\n        "lane": lane or "",\n        "step": int(step),\n        "seen_tok": int(seen_tok),\n        "loss": float(loss),\n        "batch_size": int(batch_size),\n        "block_size": int(block_size),\n        "train_script": script_name,\n        "train_argv": _script_argv(),\n        "launch": _launch_metadata(),\n        "gpu": _gpu_metrics(),\n    }\n\n    if script_sha:\n        prov["train_script_sha256"] = script_sha\n\n    if loss_ar is not None:\n        prov["loss_ar"] = float(loss_ar)\n    if loss_sat is not None:\n        prov["loss_sat"] = float(loss_sat)\n    if loss_nat is not None:\n        prov["loss_nat"] = float(loss_nat)\n\n    source_step = _step_from_text(warmstart_source_path)\n    origin_step = _origin_step_from_provenance(warmstart_source_provenance)\n    origin_seen_tok = _origin_seen_tok_from_provenance(warmstart_source_provenance)\n    if not origin_step and source_step and source_step > 0:  # AGILLM-LINEAGE-FIX 20260702\n        origin_step = int(source_step)\n\n    prov["local_step"] = int(step)\n    if source_step is not None:\n        prov["warmstart_source_step"] = int(source_step)\n    prov["global_origin_step"] = int(origin_step or 0)\n    prov["warmstart_base_step"] = int(origin_step or 0)\n    prov["effective_global_step"] = int((origin_step + int(step)) if origin_step else int(step))\n    prov["global_origin_seen_tok"] = int(origin_seen_tok or 0)\n    prov["warmstart_base_seen_tok"] = int(origin_seen_tok or 0)\n    prov["effective_seen_tok"] = int(int(origin_seen_tok or 0) + int(seen_tok))\n\n    if warmstart_source_path:\n        prov["warmstart_source_path"] = str(warmstart_source_path)\n        if warmstart_source_provenance:\n            prov["warmstart_source_provenance"] = warmstart_source_provenance\n\n    if dataset_provenance:\n        prov["dataset_provenance"] = dataset_provenance\n\n    if inference_samples is not None:\n        prov["inference_samples"] = inference_samples\n    elif _sample_core is not None and _sample_ar is not None and _sample_tok is not None:\n        try:\n            prompts = _sample_prompts or ["The meaning of", "def hello():", "2 + 2 ="]\n            prov["inference_samples"] = _infer_samples(\n                _sample_core, _sample_ar, _sample_sat,\n                _sample_tok, _sample_device or "cpu", prompts, max_new=12)\n        except Exception:\n            prov["inference_samples"] = []\n\n    return prov\n\n\ndef embed(state_dict: dict, provenance: dict) -> dict:\n    """Embed provenance into the checkpoint state dict (mutates + returns)."""\n    state_dict[PROVENANCE_KEY] = provenance\n    return state_dict\n\n\n# ---------------------------------------------------------------------------\n# Extraction (lightweight — only reads provenance from .pt wrapper)\n# ---------------------------------------------------------------------------\n\ndef extract(path: pathlib.Path) -> Optional[dict]:\n    """Extract the provenance dict from a saved .pt checkpoint.\n\n    This reads only the top-level wrapper, not the full model weights.\n    For zstd-wrapped checkpoints, it only decompresses enough to find the\n    provenance key.\n\n    Returns None if no provenance is found.\n    """\n    try:\n        import torch\n        # The checkpoint may be zstd-wrapped. Load the wrapper first.\n        wrapper = torch.load(str(path), map_location="cpu", weights_only=False)\n        if not isinstance(wrapper, dict):\n            return None\n\n        # If zstd-wrapped, decompress and get inner dict\n        inner = wrapper\n        if wrapper.get("__agillm43_payload_codec__") == "agillm43_zstd_torch_v1":\n            import zstandard as zstd\n            raw = zstd.ZstdDecompressor().decompress(bytes(wrapper["payload"].tolist()))\n            import io\n            inner = torch.load(io.BytesIO(raw), map_location="cpu", weights_only=False)\n\n        if not isinstance(inner, dict):\n            return None\n\n        provenance = inner.get(PROVENANCE_KEY)\n        if provenance is not None:\n            return provenance\n\n        # Fallback: check for sidecar\n        sidecar = path.with_suffix(".provenance.json")\n        if sidecar.exists():\n            return json.loads(sidecar.read_text())\n\n        return None\n    except Exception:\n        return None\n\n\ndef extract_provenance_sidecar(ckpt_path: pathlib.Path) -> Optional[dict]:\n    """Read the .provenance.json sidecar without touching the .pt at all."""\n    sidecar = ckpt_path.with_suffix(".provenance.json")\n    if sidecar.exists():\n        try:\n            return json.loads(sidecar.read_text())\n        except Exception:\n            pass\n    return None\n\n\ndef write_sidecar(ckpt_path: pathlib.Path, provenance: dict) -> None:\n    """Write .provenance.json sidecar beside the checkpoint."""\n    sidecar = ckpt_path.with_suffix(".provenance.json")\n    tmp = sidecar.with_suffix(".provenance.json.tmp")\n    try:\n        tmp.write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\\n")\n        tmp.replace(sidecar)\n    except Exception as exc:\n        print(f"[provenance] WARNING: failed to write sidecar {sidecar}: {exc}")\n\n\n# ---------------------------------------------------------------------------\n# Display / CLI\n# ---------------------------------------------------------------------------\n\ndef format_provenance(prov: dict, indent: int = 0) -> str:\n    """Format a provenance dict as a readable block."""\n    pad = "  " * indent\n    lines = [f"{pad}┌── Checkpoint Provenance ──"]\n    if not prov:\n        return f"{pad}└── (no provenance)"\n\n    def kv(k, v, default="—"):\n        val = v if v is not None else default\n        return f"{pad}  {k}: {val}"\n\n    lines.append(kv("Schema version", prov.get("schema_version")))\n    lines.append(kv("Type", prov.get("checkpoint_type")))\n    lines.append(kv("Step", prov.get("step")))\n    lines.append(kv("Tokens seen", f"{prov.get(\'seen_tok\', 0):,}"))\n    lines.append(kv("Loss", prov.get("loss")))\n    if prov.get("loss_ar") is not None:\n        lines.append(kv("  ├ AR loss", prov["loss_ar"]))\n    if prov.get("loss_sat") is not None:\n        lines.append(kv("  ├ SAT loss", prov["loss_sat"]))\n    if prov.get("loss_nat") is not None:\n        lines.append(kv("  └ NAT loss", prov["loss_nat"]))\n    lines.append(kv("Batch / Block", f"{prov.get(\'batch_size\')} / {prov.get(\'block_size\')}"))\n    lines.append(kv("Created (ISO)", prov.get("created_at_iso")))\n    lines.append(kv("Hostname", prov.get("hostname")))\n    lines.append(kv("PID", prov.get("pid")))\n    lines.append(kv("Lane", prov.get("lane", "—")))\n    lines.append(kv("Train script", prov.get("train_script")))\n    if prov.get("train_script_sha256"):\n        lines.append(kv("  └ SHA256", prov["train_script_sha256"][:16] + "..."))\n    gpu = prov.get("gpu", {})\n    if gpu:\n        lines.append(kv("GPU alloc/resrv/peak",\n                        f"{gpu.get(\'allocated_gb\', \'?\')}G / {gpu.get(\'reserved_gb\', \'?\')}G / {gpu.get(\'peak_allocated_gb\', \'?\')}G"))\n\n    ws = prov.get("warmstart_source_path")\n    if ws:\n        lines.append(kv("Warmstart source", ws))\n        wprov = prov.get("warmstart_source_provenance")\n        if wprov:\n            lines.append(f"{pad}  └ step={wprov.get(\'step\', \'?\')} loss={wprov.get(\'loss\', \'?\')}")\n\n    samples = prov.get("inference_samples", [])\n    if samples:\n        lines.append(f"{pad}Inference samples ({len(samples)}):")\n        for i, s in enumerate(samples):\n            gen = s.get("generation", "")\n            if len(gen) > 60:\n                gen = gen[:60] + "..."\n            lines.append(f"{pad}  [{i}] prompt={s.get(\'prompt\',\'\')!r}")\n            lines.append(f"{pad}      → {gen!r} ({s.get(\'tokens\', 0)} tokens)")\n\n    lines.append(f"{pad}└──")\n    return "\\n".join(lines)\n\n\ndef show_lineage(path: pathlib.Path, max_depth: int = 32) -> List[dict]:\n    """Walk the provenance chain (like git log) and return ordered list [oldest..newest]."""\n    chain: List[dict] = []\n    seen = set()\n    current = path.resolve() if path.exists() else path\n\n    for _ in range(max_depth):\n        prov = extract(current)\n        if prov is None:\n            break\n\n        key = str(current)\n        if key in seen:\n            break\n        seen.add(key)\n\n        entry = prov.copy()\n        entry["_checkpoint_path"] = str(current)\n        chain.append(entry)\n\n        # Walk to warmstart parent\n        ws = prov.get("warmstart_source_path")\n        if not ws:\n            break\n        wprov = prov.get("warmstart_source_provenance")\n        if not wprov:\n            break\n        current = pathlib.Path(ws)\n        # Avoid infinite loop if parent points to itself\n        if str(current) == key:\n            break\n    else:\n        chain.append({"_checkpoint_path": f"(truncated at {max_depth} hops)"})\n\n    chain.reverse()  # oldest first\n    return chain\n\n\ndef format_lineage(chain: List[dict]) -> str:\n    """Format a lineage chain as a readable tree."""\n    lines = ["Checkpoint Lineage (oldest → newest):", ""]\n    for i, entry in enumerate(chain):\n        path = entry.get("_checkpoint_path", "?")\n        step = entry.get("step", "?")\n        loss = entry.get("loss", "?")\n        iso = entry.get("created_at_iso", "?")\n        ws = entry.get("warmstart_source_path", "")\n        marker = "●" if i == len(chain) - 1 else "│" if i < len(chain) - 1 else "○"\n        lines.append(f"  {marker}  step={step}  loss={loss}  {iso}")\n        lines.append(f"  │   {path}")\n        if ws and i < len(chain) - 1:\n            lines.append(f"  │   warmstart ← {pathlib.Path(ws).name}")\n        lines.append("")\n    return "\\n".join(lines)\n\n\n# ---------------------------------------------------------------------------\n# CLI\n# ---------------------------------------------------------------------------\n\ndef _cmd_show(args_cli):\n    path = pathlib.Path(args_cli.checkpoint)\n    if not path.exists():\n        print(f"ERROR: {path} not found")\n        sys.exit(1)\n    prov = extract(path)\n    if prov is None:\n        prov = extract_provenance_sidecar(path)\n    if prov is None:\n        print(f"No provenance found in {path}")\n        sys.exit(1)\n    print(format_provenance(prov))\n    if args_cli.verbose:\n        print("\\nFull provenance JSON:")\n        print(json.dumps(prov, indent=2, sort_keys=True))\n\n\ndef _cmd_lineage(args_cli):\n    path = pathlib.Path(args_cli.checkpoint)\n    if not path.exists():\n        print(f"ERROR: {path} not found")\n        sys.exit(1)\n    chain = show_lineage(path, max_depth=args_cli.max_depth)\n    print(format_lineage(chain))\n\n\ndef _cmd_compare(args_cli):\n    a = pathlib.Path(args_cli.checkpoint_a)\n    b = pathlib.Path(args_cli.checkpoint_b)\n    for p, label in [(a, "A"), (b, "B")]:\n        if not p.exists():\n            print(f"ERROR: {label}={p} not found")\n            sys.exit(1)\n\n    pa = extract(a) or {}\n    pb = extract(b) or {}\n\n    def safe(key, d, default="—"):\n        return d.get(key, default)\n\n    print(f"Compare: {a.name}  vs  {b.name}")\n    print()\n    keys = ["step", "seen_tok", "loss", "loss_ar", "loss_sat", "loss_nat",\n            "batch_size", "block_size", "created_at_iso", "hostname", "lane"]\n    for k in keys:\n        va = safe(k, pa)\n        vb = safe(k, pb)\n        changed = " ←" if str(va) != str(vb) else ""\n        print(f"  {k:20s}  {str(va):>20s}  {str(vb):>20s}{changed}")\n\n    sa = pa.get("inference_samples", [])\n    sb = pb.get("inference_samples", [])\n    if sa or sb:\n        print()\n        print(f"  Inference samples: A={len(sa)}  B={len(sb)}")\n\n\ndef main():\n    parser = argparse.ArgumentParser(\n        description="agillm checkpoint provenance — git for checkpoints",\n        formatter_class=argparse.RawDescriptionHelpFormatter,\n        epilog=__doc__,\n    )\n    sub = parser.add_subparsers(dest="command")\n\n    p_show = sub.add_parser("show", help="Show provenance for a checkpoint")\n    p_show.add_argument("checkpoint", type=str, help="Path to .pt checkpoint")\n    p_show.add_argument("-v", "--verbose", action="store_true", help="Also dump full JSON")\n\n    p_lineage = sub.add_parser("lineage", help="Show full warmstart chain (git log)")\n    p_lineage.add_argument("checkpoint", type=str, help="Path to .pt checkpoint")\n    p_lineage.add_argument("--max-depth", type=int, default=32, help="Max hops to follow")\n\n    p_cmp = sub.add_parser("compare", help="Compare two checkpoints")\n    p_cmp.add_argument("checkpoint_a", type=str)\n    p_cmp.add_argument("checkpoint_b", type=str)\n\n    args_cli = parser.parse_args()\n    if args_cli.command == "show":\n        _cmd_show(args_cli)\n    elif args_cli.command == "lineage":\n        _cmd_lineage(args_cli)\n    elif args_cli.command == "compare":\n        _cmd_compare(args_cli)\n    else:\n        parser.print_help()\n        sys.exit(1)\n\n\nif __name__ == "__main__":\n    main()\n'
 _agillm_provenance = _agillm41_types.ModuleType("agillm_checkpoint_provenance")
 _agillm_provenance.__file__ = __file__ + "#agillm_checkpoint_provenance"
 exec(compile(_AGILLM_CHECKPOINT_PROVENANCE_SOURCE, _agillm_provenance.__file__, "exec"), _agillm_provenance.__dict__)
@@ -1277,13 +1277,13 @@ def _choose_objectives(state, args, ar_weight, sat_weight, nat_weight, do_sat_pe
     probs = []
     if ar_weight > 0.0:
         choices.append("ar")
-        probs.append(max(0.0, float(getattr(args, "dblock_ar_prob", 0.80))))
+        probs.append(max(0.0, _dblock_hot_float(args, "dblock_ar_prob", 0.80, min_value=0.0)))
     if sat_weight > 0.0 and not getattr(args, "ar_only", False):
         choices.append("sat")
-        probs.append(max(0.0, float(getattr(args, "dblock_sat_prob", 0.10))))
+        probs.append(max(0.0, _dblock_hot_float(args, "dblock_sat_prob", 0.10, min_value=0.0)))
     if nat_weight > 0.0 and not getattr(args, "ar_only", False):
         choices.append("nat")
-        probs.append(max(0.0, float(getattr(args, "dblock_nat_prob", 0.10))))
+        probs.append(max(0.0, _dblock_hot_float(args, "dblock_nat_prob", 0.10, min_value=0.0)))
     if not choices:
         return False, False, False, "none"
     total = sum(probs)
@@ -1326,9 +1326,12 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
     cs, co, ci = _edm_pre(sig)
     w = _edm_w(sig, float(getattr(args, "dblock_edm_wmax", 5.0)))
     SATB = M.SAT_BLOCK
-    ar_weight = float(getattr(args, "dblock_ar_weight", 1.0))
-    sat_weight = float(getattr(args, "dblock_sat_weight", 1.0))
-    nat_weight = float(getattr(args, "dblock_nat_weight", 1.0)) * float(getattr(args, "nat_loss_weight", 1.0))
+    ar_weight = _dblock_hot_float(args, "dblock_ar_weight", 1.0, min_value=0.0)
+    sat_weight = _dblock_hot_float(args, "dblock_sat_weight", 1.0, min_value=0.0)
+    nat_weight = (
+        _dblock_hot_float(args, "dblock_nat_weight", 1.0, min_value=0.0)
+        * _dblock_hot_float(args, "nat_loss_weight", 1.0, names=["nat_loss_weight", "dblock_nat_loss_weight"], min_value=0.0)
+    )
     do_sat_periodic = (not getattr(args, "ar_only", False)) and (
         int(getattr(args, "sat_every", 1)) <= 1 or ((int(state.get("step", 0)) + 1) % int(getattr(args, "sat_every", 1)) == 0)
     )
@@ -1471,7 +1474,7 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
         )
         nat_raw = fused_ce(nat_hidden, nat_h.proj.weight, nat_targets)
         nat_raw_val = float(nat_raw.detach())
-        nat = nat_weight * nat_raw
+        nat = nat_weight * w * nat_raw
         nat_val = float(nat.detach())
         _profile_toc(state, "nat_ce", _t)
         _t = _profile_tic(prof)
@@ -1722,7 +1725,7 @@ def _agillm43_lineage_info(source_path: Optional[str], source_provenance: Option
         if origin_step <= 0:
             parent = source_provenance.get("warmstart_source_path") or source_provenance.get("source_path") or ""
             parent_step = _status_parse_step(parent)
-            if parent_step and parent_step >= 1_000_000:
+            if parent_step and parent_step > 0:  # AGILLM-LINEAGE-FIX 20260702: was >= 1_000_000 (broke warmstart from <1M-step recovery ckpts)
                 origin_step = parent_step
         for key in ("global_origin_seen_tok", "warmstart_base_seen_tok"):
             try:
@@ -1732,7 +1735,7 @@ def _agillm43_lineage_info(source_path: Optional[str], source_provenance: Option
             if value > 0:
                 origin_seen_tok = value
                 break
-    if origin_step <= 0 and source_step and (warmstart_kind == "warmstarted_from_master" or source_step >= 1_000_000):
+    if origin_step <= 0 and source_step and source_step > 0:  # AGILLM-LINEAGE-FIX 20260702: was 'master or >= 1_000_000' (broke <1M-step recovery warmstarts)
         origin_step = int(source_step)
 
     return {
@@ -1803,6 +1806,9 @@ def _status_find_trainers(script_path: Path) -> List[Dict[str, Any]]:
             continue
         args = _status_read_cmdline(proc_dir)
         if not args or "train" not in args:
+            continue
+        if Path(args[0]).name in {"bash", "dash", "sh"} and "-c" in args[:3]:
+            # Launch wrappers carry the trainer argv for exit logging, but are not trainers.
             continue
         resolved_script = None
         for arg in args:
@@ -2296,14 +2302,14 @@ import torch.utils.checkpoint as torch_checkpoint
 
 # SafeProgress - Claude-safe progress (discrete lines, not single growing line)
 class SafeProgress:
-    def __init__(self, total, initial=0, unit="tok", print_every=100, print_every_sec=60):
+    def __init__(self, total, initial=0, unit="tok", print_every=100, print_every_sec=60, initial_step=0):
         self.total, self.n, self.unit = total, initial, unit
         self.initial = initial
         self.last_print, self.postfix = initial, {}
         self.print_every = max(1, int(print_every))
         self.print_every_sec = max(1, int(print_every_sec))
-        self.step = 0
-        self.last_print_step = 0
+        self.step = int(initial_step or 0)
+        self.last_print_step = self.step
         self.start_time = __import__('time').time()
         self.last_print_time = self.start_time
     def update(self, n=1):
@@ -2389,7 +2395,52 @@ def _hot_int_from_config(cfg: dict, names: list[str], default: int) -> int:
     return int(default)
 
 
+def _hot_float_from_config(cfg: dict, names: list[str], default: float, min_value=None, max_value=None) -> float:
+    """Read a float from hot_config, accepting top-level or dblock-nested keys."""
+    if not isinstance(cfg, dict):
+        return float(default)
+    candidates = []
+    for name in names:
+        candidates.append(cfg.get(name))
+    nested = cfg.get("dblock")
+    if isinstance(nested, dict):
+        for name in names:
+            candidates.append(nested.get(name))
+    for value in candidates:
+        if value is None or value == "":
+            continue
+        try:
+            out = float(value)
+        except Exception:
+            continue
+        if min_value is not None:
+            out = max(float(min_value), out)
+        if max_value is not None:
+            out = min(float(max_value), out)
+        return out
+    return float(default)
+
+
 _hot_dblock_loss_tokens_seen = {}
+_hot_dblock_float_seen = {}
+
+
+def _dblock_hot_float(args, attr: str, default: float, names=None, min_value=None, max_value=None) -> float:
+    cli_default = float(getattr(args, attr, default) or default)
+    keys = list(names or [attr])
+    if attr not in keys:
+        keys.insert(0, attr)
+    try:
+        cfg = get_hot_config()
+    except Exception:
+        return cli_default
+    value = _hot_float_from_config(cfg, keys, cli_default, min_value=min_value, max_value=max_value)
+    key = (id(args), attr)
+    if _hot_dblock_float_seen.get(key) != value:
+        _hot_dblock_float_seen[key] = value
+        if value != cli_default:
+            print(f"[hot_config] {attr}={value} (cli_default={cli_default})", flush=True)
+    return value
 
 def _dblock_loss_token_cap(args, objective: str) -> int:
     """Hot-reload AR/SAT/NAT sampled CE token caps from hot_config.json.
@@ -2454,6 +2505,24 @@ def _dataset_merge_csv(*groups: str) -> str:
     return ",".join(by_key[key] for key in ordered if key in by_key)
 
 
+def _dataset_remove_csv(sources: str, removals: str) -> str:
+    """Remove dataset specs by unweighted key or substring."""
+    specs = _dataset_specs_csv(sources)
+    remove_specs = _dataset_specs_csv(removals)
+    if not specs or not remove_specs:
+        return str(sources or "").strip()
+    remove_keys = {_dataset_spec_without_weight(spec) for spec in remove_specs if spec}
+    remove_needles = {key.lower() for key in remove_keys if key}
+    kept = []
+    for spec in specs:
+        key = _dataset_spec_without_weight(spec)
+        key_l = key.lower()
+        if key in remove_keys or any(needle and needle in key_l for needle in remove_needles):
+            continue
+        kept.append(spec)
+    return ",".join(kept)
+
+
 def _looks_like_numeracy_source(spec: str) -> bool:
     base = _dataset_spec_without_weight(spec).lower()
     return "agillm_math_numeracy" in base or "math_numeracy_synth" in base
@@ -2500,6 +2569,12 @@ def get_hot_datasets(default_sources: str) -> str:
     if append_ds:
         sources = _dataset_merge_csv(sources, append_ds)
         print(f"[hot_config] Appended datasets: {append_ds}", flush=True)
+    remove_ds = _dataset_config_to_csv(cfg.get("datasets_remove") or cfg.get("remove_datasets"))
+    if remove_ds:
+        before = sources
+        sources = _dataset_remove_csv(sources, remove_ds)
+        if sources != before:
+            print(f"[hot_config] Removed datasets from mix: {remove_ds}", flush=True)
     return sources
 
 
@@ -3002,16 +3077,29 @@ def _prune_checkpoints(save_dir: pathlib.Path, phase_name: str, max_ckpts: int):
         return
     try:
         pattern = f"{phase_name}_step*.pt"
+        pinned = _pinned_basenames(save_dir) if '_pinned_basenames' in globals() else set()
         ckpts = sorted(
-            [p for p in save_dir.glob(pattern) if _is_probably_ckpt(p)],
+            [p for p in save_dir.glob(pattern)
+             if _is_probably_ckpt(p)
+             and not p.name.endswith('.resume_delta.pt')
+             and p.name not in pinned],
             key=lambda p: p.stat().st_mtime
         )
         excess = len(ckpts) - max_ckpts
         if excess > 0:
             for p in ckpts[:excess]:
                 try:
-                    p.unlink()
-                    print(f"  [prune] deleted old {p.name}")
+                    for sidecar in (
+                        p,
+                        p.with_name(p.name + ".tokenizer.json"),
+                        p.with_suffix(".provenance.json"),
+                    ):
+                        try:
+                            if sidecar.exists():
+                                sidecar.unlink()
+                        except Exception:
+                            pass
+                    print(f"  [prune] deleted old {p.name} (+ sidecars)")
                 except Exception:
                     pass
     except Exception as e:
@@ -3269,7 +3357,7 @@ def _open_stream_one(ds_name: str, seed: int, streaming: bool = True):
         ds = load_dataset(base, config, split=split, streaming=streaming, download_config=dc) if config else \
              load_dataset(base, split=split, streaming=streaming, download_config=dc)
     if streaming:
-        return iter(ds.shuffle(buffer_size=1000, seed=seed))
+        return iter(ds.shuffle(buffer_size=200, seed=seed))  # AGILLM-OOM-FIX 20260702: was 1000, OOM-killed at step 1 on 31GB RAM
     else:
         print(f"[download] Got {len(ds):,} examples. Shuffling...")
         ds = ds.shuffle(seed=seed)
@@ -5122,9 +5210,135 @@ def _agillm43_tensor_state_summary(state) -> dict:
     return {"codec": "raw"}
 
 
+_AGILLM43_SHARDED_CODEC_MAGIC = "agillm43_block_sharded_torch_v1"
+
+
+def _agillm43_is_sharded_codec(codec: str) -> bool:
+    mode = str(codec or "").strip().lower().replace("_", "-")
+    return mode in {"sharded", "sharded-zstd", "block-sharded", "block-sharded-zstd", "blocks", "blocks-zstd"}
+
+
+def _agillm43_shard_dir_for_path(path) -> pathlib.Path:
+    return pathlib.Path(str(path) + ".shards")
+
+
+def _agillm43_shard_safe_name(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(name)).strip("._") or "shard"
+
+
+def _agillm43_save_sharded_pt(obj, path, zstd_level: int = 1):
+    """Save a checkpoint as a manifest plus independently loadable block/head shards."""
+    import shutil
+    path = pathlib.Path(path)
+    shard_dir = _agillm43_shard_dir_for_path(path)
+    if shard_dir.exists():
+        shutil.rmtree(shard_dir)
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    shard_codec = "zstd" if int(zstd_level or 0) > 0 else "off"
+    entries = []
+
+    def _save_entry(name, payload, target, mode="set"):
+        shard_name = _agillm43_shard_safe_name(name) + ".pt"
+        shard_path = shard_dir / shard_name
+        info = _agillm43_save_pt(payload, shard_path, codec=shard_codec, zstd_level=zstd_level)
+        entries.append({
+            "name": str(name),
+            "target": list(target),
+            "mode": str(mode),
+            "shard": shard_name,
+            "codec": info.get("codec", "raw"),
+            "nbytes": int(shard_path.stat().st_size),
+            "sha256": _sha256_file(shard_path),
+        })
+
+    if not isinstance(obj, dict):
+        skeleton = {"payload": None}
+        _save_entry("payload", obj, ["payload"], "set")
+    else:
+        skeleton = dict(obj)
+        core_sd = skeleton.get("core")
+        if isinstance(core_sd, dict):
+            core_base = {}
+            block_groups = {}
+            for key, value in core_sd.items():
+                m = re.match(r"blocks\.(\d+)\.", str(key))
+                if m:
+                    block_groups.setdefault(int(m.group(1)), {})[key] = value
+                else:
+                    core_base[key] = value
+            skeleton["core"] = core_base
+            for idx in sorted(block_groups):
+                _save_entry(f"core_block_{idx:04d}", block_groups[idx], ["core"], "dict_update")
+        for top_key in ("ar", "sat", "nat", "opt", "scaler"):
+            if top_key in skeleton:
+                payload = skeleton.pop(top_key)
+                _save_entry(top_key, payload, [top_key], "set")
+    manifest = {
+        _AGILLM43_SHARDED_CODEC_MAGIC: _AGILLM43_SHARDED_CODEC_MAGIC,
+        "format_version": 1,
+        "codec": "block-sharded",
+        "shard_codec": shard_codec,
+        "shard_dir": shard_dir.name,
+        "skeleton": skeleton,
+        "entries": entries,
+    }
+    torch.save(manifest, path, _use_new_zipfile_serialization=False)
+    return {"codec": "block-sharded", "shards": len(entries), "shard_dir": str(shard_dir), "shard_codec": shard_codec}
+
+
+def _agillm43_load_sharded_pt(path, manifest: dict, map_location="cpu", weights_only=False, skip_keys=None):
+    path = pathlib.Path(path)
+    skip = {str(k) for k in (skip_keys or set())}
+    shard_dir = path.parent / str(manifest.get("shard_dir") or (path.name + ".shards"))
+    state = dict(manifest.get("skeleton") or {})
+    for entry in manifest.get("entries") or []:
+        target = list(entry.get("target") or [])
+        if not target:
+            continue
+        top_key = str(target[0])
+        if top_key in skip:
+            continue
+        shard_path = shard_dir / str(entry.get("shard"))
+        payload = _agillm43_load_pt(shard_path, map_location=map_location, weights_only=weights_only)
+        if entry.get("mode") == "dict_update":
+            base = state.setdefault(top_key, {})
+            if not isinstance(base, dict):
+                raise ValueError(f"sharded checkpoint target {top_key!r} is not a dict")
+            base.update(payload)
+        else:
+            state[top_key] = payload
+    if set(state.keys()) == {"payload"}:
+        return state["payload"]
+    return state
+
+
+def _agillm43_finalize_pt_save(tmp, path, info: dict):
+    """Atomically publish a .pt and, for sharded packages, its shard directory."""
+    tmp = pathlib.Path(tmp)
+    path = pathlib.Path(path)
+    if info.get("codec") != "block-sharded":
+        tmp.replace(path)
+        return
+    import shutil
+    tmp_shards = pathlib.Path(info.get("shard_dir") or _agillm43_shard_dir_for_path(tmp))
+    final_shards = _agillm43_shard_dir_for_path(path)
+    if final_shards.exists():
+        shutil.rmtree(final_shards)
+    tmp.replace(path)
+    if tmp_shards.exists():
+        tmp_shards.replace(final_shards)
+    manifest = torch.load(path, map_location="cpu", weights_only=False)
+    if isinstance(manifest, dict) and manifest.get(_AGILLM43_SHARDED_CODEC_MAGIC) == _AGILLM43_SHARDED_CODEC_MAGIC:
+        manifest["shard_dir"] = final_shards.name
+        torch.save(manifest, path, _use_new_zipfile_serialization=False)
+        info["shard_dir"] = str(final_shards)
+
+
 def _agillm43_save_pt(obj, path, codec: str = "off", zstd_level: int = 1):
     codec = str(codec or "off").strip().lower()
     zstd_level = _agillm43_zstd_level_from_codec(codec, zstd_level)
+    if _agillm43_is_sharded_codec(codec):
+        return _agillm43_save_sharded_pt(obj, path, zstd_level=zstd_level)
     if codec in {"", "off", "none", "raw", "false", "0"}:
         torch.save(obj, path, _use_new_zipfile_serialization=False)
         return {"codec": "raw"}
@@ -5149,9 +5363,379 @@ def _agillm43_save_pt(obj, path, codec: str = "off", zstd_level: int = 1):
     return {"codec": "zstd", "raw_nbytes": len(raw), "packed_nbytes": len(packed), "zstd_level": int(zstd_level), "ratio": float(len(raw)) / max(1.0, float(len(packed)))}
 
 
-def _agillm43_load_pt(path, map_location="cpu", weights_only=False):
+
+def _agillm43_decompress_cache_enabled() -> bool:
+    text = str(os.environ.get("AGILLM43_DECOMPRESS_CACHE", "1") or "1").strip().lower()
+    return text not in {"0", "false", "no", "off", "disable", "disabled"}
+
+
+_AGILLM43_ZSTD_FRAME_MAGIC = b"\x28\xb5\x2f\xfd"
+
+
+def _agillm43_source_sha256_sidecar(path: pathlib.Path) -> str:
+    candidates = [
+        path.with_suffix(path.suffix + ".sha256"),
+        path.with_suffix(".sha256"),
+    ]
+    for sidecar in candidates:
+        try:
+            if not sidecar.exists():
+                continue
+            text = sidecar.read_text(errors="ignore").strip()
+            m = re.search(r"\b([0-9a-fA-F]{64})\b", text)
+            if m:
+                return m.group(1).lower()
+        except Exception:
+            pass
+    return ""
+
+
+def _agillm43_decompress_cache_info(path) -> dict:
+    path = pathlib.Path(path)
+    st = path.stat()
+    source_sha256 = _agillm43_source_sha256_sidecar(path)
+    source_id = source_sha256 or f"{int(st.st_size):x}-{int(st.st_mtime_ns):x}"
+    source_id = re.sub(r"[^0-9a-fA-F._-]", "_", source_id)[:20]
+    cache_dir = path.parent / ".agillm43_decompressed_cache"
+    cache_path = cache_dir / f"{path.name}.{source_id}.raw.pt"
+    return {
+        "source_path": str(path.resolve()),
+        "source_name": path.name,
+        "source_size": int(st.st_size),
+        "source_mtime_ns": int(st.st_mtime_ns),
+        "source_sha256": source_sha256,
+        "source_id": source_id,
+        "cache_dir": cache_dir,
+        "cache_path": cache_path,
+        "manifest_path": cache_path.with_suffix(cache_path.suffix + ".json"),
+    }
+
+
+def _agillm43_manifest_matches(info: dict, manifest: dict) -> bool:
+    if int(manifest.get("schema_version") or 0) != 1:
+        return False
+    if str(manifest.get("source_path") or "") != str(info.get("source_path") or ""):
+        return False
+    if int(manifest.get("source_size") or -1) != int(info.get("source_size") or -2):
+        return False
+    cached_sha = str(manifest.get("source_sha256") or "")
+    source_sha = str(info.get("source_sha256") or "")
+    if source_sha or cached_sha:
+        return cached_sha == source_sha
+    return int(manifest.get("source_mtime_ns") or -1) == int(info.get("source_mtime_ns") or -2)
+
+
+def _agillm43_find_decompressed_cache(path):
+    if not _agillm43_decompress_cache_enabled():
+        return None
+    try:
+        info = _agillm43_decompress_cache_info(path)
+        cache_path = info["cache_path"]
+        manifest_path = info["manifest_path"]
+        if not (cache_path.exists() and manifest_path.exists()):
+            return None
+        if cache_path.stat().st_size <= 0:
+            return None
+        manifest = json.loads(manifest_path.read_text())
+        if not _agillm43_manifest_matches(info, manifest):
+            return None
+        return cache_path
+    except Exception:
+        return None
+
+
+def _agillm43_file_looks_like_zstd_wrapper(path: pathlib.Path) -> bool:
+    try:
+        with open(path, "rb") as f:
+            head = f.read(1 << 20)
+        return (
+            _AGILLM43_PAYLOAD_CODEC_MAGIC.encode("utf-8") in head
+            and b"agillm43_zstd_torch_v1" in head
+        )
+    except Exception:
+        return False
+
+
+def _agillm43_find_embedded_zstd_frame_offset(path: pathlib.Path, max_scan: int = 256 << 20):
+    try:
+        magic = _AGILLM43_ZSTD_FRAME_MAGIC
+        chunk_size = 16 << 20
+        scanned = 0
+        prev = b""
+        with open(path, "rb") as f:
+            while scanned < int(max_scan):
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    return None
+                hay = prev + chunk
+                idx = hay.find(magic)
+                if idx >= 0:
+                    return int(scanned - len(prev) + idx)
+                prev = hay[-(len(magic) - 1):]
+                scanned += len(chunk)
+    except Exception:
+        return None
+    return None
+
+
+def _agillm43_zstd_frame_content_size(path: pathlib.Path, offset: int) -> int:
+    try:
+        import zstandard as zstd
+        with open(path, "rb") as f:
+            f.seek(int(offset))
+            head = f.read(32)
+        params = zstd.get_frame_parameters(head)
+        size = int(getattr(params, "content_size", 0) or 0)
+        return max(0, size)
+    except Exception:
+        return 0
+
+
+def _agillm43_stream_decompress_file_frame_to_file(path: pathlib.Path, offset: int, out_file) -> int:
+    import zstandard as zstd
+    counter = {"n": 0}
+
+    class _CountingWriter:
+        def write(self, chunk):
+            out_file.write(chunk)
+            counter["n"] += len(chunk)
+            return len(chunk)
+
+    with open(path, "rb") as f:
+        f.seek(int(offset))
+        zstd.ZstdDecompressor().copy_stream(f, _CountingWriter())
+    return int(counter["n"])
+
+
+def _agillm43_write_decompressed_cache_from_file_frame(path) -> pathlib.Path | None:
+    path = pathlib.Path(path)
+    if not _agillm43_file_looks_like_zstd_wrapper(path):
+        return None
+    offset = _agillm43_find_embedded_zstd_frame_offset(path)
+    if offset is None:
+        return None
+    info = _agillm43_decompress_cache_info(path)
+    cache_path = info["cache_path"]
+    manifest_path = info["manifest_path"]
+    if cache_path.exists() and manifest_path.exists() and cache_path.stat().st_size > 0:
+        try:
+            manifest = json.loads(manifest_path.read_text())
+            if _agillm43_manifest_matches(info, manifest):
+                return cache_path
+        except Exception:
+            pass
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_nbytes = _agillm43_zstd_frame_content_size(path, offset)
+    if raw_nbytes > 0:
+        try:
+            import shutil
+            free = int(shutil.disk_usage(str(cache_path.parent)).free)
+            reserve = 512 * 1024 * 1024
+            if free < raw_nbytes + reserve:
+                raise RuntimeError(
+                    f"not enough free disk for decompressed checkpoint cache: "
+                    f"need about {(raw_nbytes + reserve) / (1024 ** 3):.2f}GB, "
+                    f"free {free / (1024 ** 3):.2f}GB"
+                )
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+    tmp_path = cache_path.with_name(f".{cache_path.name}.{os.getpid()}.tmp")
+    tmp_manifest = manifest_path.with_name(f".{manifest_path.name}.{os.getpid()}.tmp")
+    try:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        print(f"[ckpt-cache] streaming embedded zstd once to {cache_path.name}", flush=True)
+        with open(tmp_path, "wb") as f:
+            written = _agillm43_stream_decompress_file_frame_to_file(path, offset, f)
+        if raw_nbytes > 0 and int(written) != raw_nbytes:
+            raise RuntimeError(f"decompressed cache size mismatch: wrote {written}, expected {raw_nbytes}")
+        os.replace(str(tmp_path), str(cache_path))
+        manifest = {
+            "schema_version": 1,
+            "cache_kind": "agillm43_decompressed_pt",
+            "source_path": info["source_path"],
+            "source_name": info["source_name"],
+            "source_size": info["source_size"],
+            "source_mtime_ns": info["source_mtime_ns"],
+            "source_sha256": info["source_sha256"],
+            "source_id": info["source_id"],
+            "zstd_frame_offset": int(offset),
+            "raw_nbytes": int(written),
+            "created_at_unix": time.time(),
+        }
+        tmp_manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        os.replace(str(tmp_manifest), str(manifest_path))
+        return cache_path
+    finally:
+        for stale in (tmp_path, tmp_manifest):
+            try:
+                if stale.exists():
+                    stale.unlink()
+            except Exception:
+                pass
+
+
+class _Agillm43PayloadReader:
+    def __init__(self, data, offset: int = 0, chunk_size: int = 8 << 20):
+        self._owner = None
+        if torch.is_tensor(data):
+            tensor = data.detach().cpu().contiguous()
+            self._owner = tensor.numpy()
+            view = memoryview(self._owner)
+        else:
+            if isinstance(data, memoryview):
+                self._owner = data
+                view = data
+            else:
+                self._owner = data
+                view = memoryview(data if isinstance(data, (bytes, bytearray)) else bytes(data))
+        self._view = view.cast("B")
+        self._pos = max(0, int(offset))
+        self._chunk_size = max(1 << 20, int(chunk_size or (8 << 20)))
+
+    def read(self, n: int = -1) -> bytes:
+        if self._pos >= len(self._view):
+            return b""
+        if n is None or n < 0:
+            n = self._chunk_size
+        n = min(int(n), self._chunk_size)
+        end = min(len(self._view), self._pos + n)
+        out = self._view[self._pos:end].tobytes()
+        self._pos = end
+        return out
+
+    def prefix(self, n: int) -> bytes:
+        end = min(len(self._view), int(n))
+        return self._view[:end].tobytes()
+
+
+def _agillm43_stream_decompress_payload_to_file(data, out_file) -> int:
+    reader = _Agillm43PayloadReader(data)
+    if reader.prefix(4) == b"ZLIB":
+        import zlib
+        reader = _Agillm43PayloadReader(data, offset=4)
+        dec = zlib.decompressobj()
+        total = 0
+        while True:
+            chunk = reader.read()
+            if not chunk:
+                break
+            raw = dec.decompress(chunk)
+            if raw:
+                out_file.write(raw)
+                total += len(raw)
+        tail = dec.flush()
+        if tail:
+            out_file.write(tail)
+            total += len(tail)
+        return total
+    import zstandard as zstd
+    counter = {"n": 0}
+
+    class _CountingWriter:
+        def write(self, chunk):
+            out_file.write(chunk)
+            counter["n"] += len(chunk)
+            return len(chunk)
+
+    zstd.ZstdDecompressor().copy_stream(reader, _CountingWriter())
+    return int(counter["n"])
+
+
+def _agillm43_write_decompressed_cache(path, wrapper: dict) -> pathlib.Path:
+    info = _agillm43_decompress_cache_info(path)
+    cache_path = info["cache_path"]
+    manifest_path = info["manifest_path"]
+    if cache_path.exists() and manifest_path.exists() and cache_path.stat().st_size > 0:
+        try:
+            manifest = json.loads(manifest_path.read_text())
+            if _agillm43_manifest_matches(info, manifest):
+                return cache_path
+        except Exception:
+            pass
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_nbytes = int(wrapper.get("raw_nbytes") or 0)
+    if raw_nbytes > 0:
+        try:
+            import shutil
+            free = int(shutil.disk_usage(str(cache_path.parent)).free)
+            reserve = 512 * 1024 * 1024
+            if free < raw_nbytes + reserve:
+                raise RuntimeError(
+                    f"not enough free disk for decompressed checkpoint cache: "
+                    f"need about {(raw_nbytes + reserve) / (1024 ** 3):.2f}GB, "
+                    f"free {free / (1024 ** 3):.2f}GB"
+                )
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+    tmp_path = cache_path.with_name(f".{cache_path.name}.{os.getpid()}.tmp")
+    tmp_manifest = manifest_path.with_name(f".{manifest_path.name}.{os.getpid()}.tmp")
+    try:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        print(f"[ckpt-cache] decompressing once to {cache_path.name}", flush=True)
+        with open(tmp_path, "wb") as f:
+            written = _agillm43_stream_decompress_payload_to_file(wrapper["payload"], f)
+        if raw_nbytes > 0 and int(written) != raw_nbytes:
+            raise RuntimeError(f"decompressed cache size mismatch: wrote {written}, expected {raw_nbytes}")
+        os.replace(str(tmp_path), str(cache_path))
+        manifest = {
+            "schema_version": 1,
+            "cache_kind": "agillm43_decompressed_pt",
+            "source_path": info["source_path"],
+            "source_name": info["source_name"],
+            "source_size": info["source_size"],
+            "source_mtime_ns": info["source_mtime_ns"],
+            "source_sha256": info["source_sha256"],
+            "source_id": info["source_id"],
+            "raw_nbytes": int(written),
+            "created_at_unix": time.time(),
+        }
+        tmp_manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        os.replace(str(tmp_manifest), str(manifest_path))
+        return cache_path
+    finally:
+        for stale in (tmp_path, tmp_manifest):
+            try:
+                if stale.exists():
+                    stale.unlink()
+            except Exception:
+                pass
+
+def _agillm43_load_pt(path, map_location="cpu", weights_only=False, skip_keys=None):
+    path = pathlib.Path(path)
+    cached = _agillm43_find_decompressed_cache(path)
+    if cached is not None:
+        try:
+            print(f"[ckpt-cache] using decompressed cache {cached.name}", flush=True)
+            return torch.load(cached, map_location=map_location, weights_only=weights_only)
+        except Exception as exc:
+            print(f"[ckpt-cache] ignoring invalid cache {cached.name}: {exc}", flush=True)
+            try:
+                cached.unlink()
+                cached.with_suffix(cached.suffix + ".json").unlink(missing_ok=True)
+            except Exception:
+                pass
+    if _agillm43_decompress_cache_enabled():
+        cached = _agillm43_write_decompressed_cache_from_file_frame(path)
+        if cached is not None:
+            print(f"[ckpt-cache] using decompressed cache {cached.name}", flush=True)
+            return torch.load(cached, map_location=map_location, weights_only=weights_only)
     obj = torch.load(path, map_location=map_location, weights_only=weights_only)
+    if isinstance(obj, dict) and obj.get(_AGILLM43_SHARDED_CODEC_MAGIC) == _AGILLM43_SHARDED_CODEC_MAGIC:
+        return _agillm43_load_sharded_pt(path, obj, map_location=map_location, weights_only=weights_only, skip_keys=skip_keys)
     if isinstance(obj, dict) and obj.get(_AGILLM43_PAYLOAD_CODEC_MAGIC) == "agillm43_zstd_torch_v1":
+        if _agillm43_decompress_cache_enabled():
+            import gc as _gc
+            cached = _agillm43_write_decompressed_cache(path, obj)
+            del obj
+            _gc.collect()
+            print(f"[ckpt-cache] using decompressed cache {cached.name}", flush=True)
+            return torch.load(cached, map_location=map_location, weights_only=weights_only)
         import io
         raw = _agillm43_zstd_decompress(obj["payload"])
         return torch.load(io.BytesIO(raw), map_location=map_location, weights_only=weights_only)
@@ -5164,12 +5748,14 @@ def _do_delta_save(tensors: dict, path: pathlib.Path, meta: dict, codec: str = "
         tmp = path.with_suffix(path.suffix + ".dtmp")
         payload = {"weights": tensors, **meta}
         info = _agillm43_save_pt(payload, tmp, codec=codec, zstd_level=1)
-        digest = _sha256_file(tmp)
-        tmp.replace(path)
+        _agillm43_finalize_pt_save(tmp, path, info)
+        digest = _sha256_file(path)
         # Write sidecar checksum
         path.with_suffix(".sha256").write_text(f"{digest}  {path.name}\n")
         if info.get("codec") == "zstd":
             print(f"  [delta] saved {path.name} ({digest[:12]}...) codec=zstd ratio={info.get('ratio', 0.0):.2f}x")
+        elif info.get("codec") == "block-sharded":
+            print(f"  [delta] saved {path.name} ({digest[:12]}...) codec=block-sharded shards={info.get('shards', 0)}")
         else:
             print(f"  [delta] saved {path.name} ({digest[:12]}...) codec=raw")
     except Exception as e:
@@ -5413,6 +5999,58 @@ def _fuse_legacy_qkv_optimizer_state(opt_state: dict, opt, core, ar_h, sat_h, na
 
     return {"state": new_states, "param_groups": new_groups}
 
+def _optimizer_state_compatibility_reason(opt_state: dict, opt) -> tuple[bool, str]:
+    """Return whether a checkpoint optimizer state is safe to load into opt.
+
+    torch Optimizer.load_state_dict can accept mismatched param-group option
+    dictionaries and only fail later at step time. A diagnostic PowerStep
+    checkpoint uses momentum/beta groups; AdamW-family optimizers need
+    betas/eps. Cross-family states are treated as weight-only resumes.
+    """
+    if not isinstance(opt_state, dict):
+        return False, "checkpoint has no optimizer state"
+    groups = opt_state.get("param_groups")
+    if not isinstance(groups, list) or not groups:
+        return False, "checkpoint optimizer has no param_groups"
+    saved_keys = set()
+    for group in groups:
+        if isinstance(group, dict):
+            saved_keys.update(group.keys())
+    saved_keys.discard("params")
+    saved_keys.discard("param_names")
+    cls = opt.__class__.__name__.lower()
+    saved_powerstep = bool({"momentum", "beta"} & saved_keys)
+    saved_adam = bool({"betas", "eps"} & saved_keys)
+    wants_powerstep = "powerstep" in cls
+    wants_adam = "adam" in cls
+    if wants_powerstep and saved_adam and not saved_powerstep:
+        return False, f"Adam-style checkpoint optimizer keys {sorted(saved_keys)} do not match {opt.__class__.__name__}"
+    if wants_adam:
+        if saved_powerstep and not saved_adam:
+            return False, f"PowerStep checkpoint optimizer keys {sorted(saved_keys)} do not match {opt.__class__.__name__}"
+        if not saved_adam:
+            return False, f"checkpoint optimizer keys {sorted(saved_keys)} are missing Adam betas/eps for {opt.__class__.__name__}"
+    return True, "compatible"
+
+
+def _agillm43_release_loaded_checkpoint(ck):
+    """Drop large checkpoint payloads promptly after resume."""
+    try:
+        if isinstance(ck, dict):
+            ck.clear()
+    except Exception:
+        pass
+    try:
+        import gc as _gc
+        _gc.collect()
+    except Exception:
+        pass
+    try:
+        import ctypes as _ctypes
+        _ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
 def save_delta(core, ar_h, sat_h, nat_h, step: int, seen_tok: int, save_dir: pathlib.Path, phase_name: str, delta_codec: str = "zstd3", provenance=None, origin_tag: str = "", dt_tag: str = "", role_tag: str = ""):
     """Save weight-only delta in background thread. Non-blocking."""
     global _delta_thread
@@ -5528,7 +6166,7 @@ def _disk_hygiene(save_dir, phase_name: str, args, reason: str = ""):
                 rm(t)
         # 2) full checkpoints beyond --max_ckpts (keep newest)
         keep_full = max(1, int(getattr(args, "max_ckpts", 2) or 2))
-        fulls = newest_first(list(save_dir.glob(f"{phase_name}_step*.pt")))
+        fulls = newest_first([p for p in save_dir.glob(f"{phase_name}_step*.pt") if not p.name.endswith(".resume_delta.pt")])
         for p in fulls[keep_full:]:
             if not young(p):
                 rm(p)
@@ -5595,7 +6233,7 @@ def _disk_hygiene(save_dir, phase_name: str, args, reason: str = ""):
             for p in newest_first(list(save_dir.glob(f"{phase_name}_delta_step*.pt")))[1:]:
                 if not young(p):
                     rm(p)
-            for p in newest_first(list(save_dir.glob(f"{phase_name}_step*.pt")))[1:]:
+            for p in newest_first([p for p in save_dir.glob(f"{phase_name}_step*.pt") if not p.name.endswith(".resume_delta.pt")])[1:]:
                 if not young(p):
                     rm(p)
             print(f"  [disk] after escalation: {free_gb():.1f}GB free", flush=True)
@@ -5702,6 +6340,66 @@ def _load_module_state_compatible(module: nn.Module, state: dict, label: str = "
         print(f"[ckpt] {label}: tied head active; skipped old untied tensors: {', '.join(skipped[:4])}{'...' if len(skipped)>4 else ''}")
     return len(filt)
 
+
+class _skip_param_init:
+    """Suppress torch.nn.init.* tensor fills while constructing inference models.
+
+    Every parameter is overwritten from the checkpoint immediately after
+    construction, so constructor random init is pure startup cost. Params the
+    checkpoint cannot supply are re-initialized afterwards.
+    """
+    _FILLS = (
+        "uniform_", "normal_", "trunc_normal_", "constant_", "ones_", "zeros_",
+        "eye_", "dirac_", "xavier_uniform_", "xavier_normal_",
+        "kaiming_uniform_", "kaiming_normal_", "orthogonal_", "sparse_",
+    )
+
+    def __enter__(self):
+        import torch.nn.init as _init
+        self._saved = {}
+        for name in self._FILLS:
+            fn = getattr(_init, name, None)
+            if fn is None:
+                continue
+            self._saved[name] = fn
+
+            def _noop(tensor, *args, **kwargs):
+                return tensor
+
+            setattr(_init, name, _noop)
+        return self
+
+    def __exit__(self, *exc):
+        import torch.nn.init as _init
+        for name, fn in self._saved.items():
+            setattr(_init, name, fn)
+        return False
+
+
+def _reinit_params_missing_from_state(core: nn.Module, sd_core: dict):
+    if not isinstance(sd_core, dict):
+        return
+    present = set(_strip_orig_mod_prefix(sd_core).keys())
+    missing_mods = {}
+    for name, _ in core.named_parameters():
+        if name in present:
+            continue
+        mod_name = name.rsplit(".", 1)[0] if "." in name else ""
+        missing_mods.setdefault(mod_name, name)
+    reinit = 0
+    for mod_name, param_name in missing_mods.items():
+        try:
+            mod = core.get_submodule(mod_name) if mod_name else core
+        except AttributeError:
+            mod = None
+        if mod is not None and hasattr(mod, "reset_parameters"):
+            mod.reset_parameters()
+            reinit += 1
+        else:
+            print(f"[infer] WARNING: param {param_name} absent from checkpoint and module has no reset_parameters; it may be uninitialized", flush=True)
+    if reinit:
+        print(f"[infer] reinitialized {reinit} module(s) for checkpoint-missing parameters", flush=True)
+
 def load_delta(path: pathlib.Path, core, ar_h, sat_h, nat_h=None):
     """Load weight-only delta. Returns (step, seen_tok) or raises."""
     # Verify checksum if sidecar exists
@@ -5725,7 +6423,10 @@ def load_delta(path: pathlib.Path, core, ar_h, sat_h, nat_h=None):
         else:
             print("[nat] Delta has no NAT head; keeping fresh NAT initialization")
     _restore_tokenizer_from_ckpt(ck, path)
-    return ck.get("step", 0), ck.get("seen_tok", 0)
+    step = ck.get("step", 0)
+    seen_tok = ck.get("seen_tok", 0)
+    _agillm43_release_loaded_checkpoint(ck)
+    return step, seen_tok
 
 def _flush_delta():
     """Wait for any in-flight delta save to complete."""
@@ -5786,7 +6487,7 @@ def save_ckpt(path: pathlib.Path, core, ar_h, sat_h, nat_h, opt, scaler, meta, c
         state["agillm43_warmstart_source_path"] = source_path
         state["agillm43_checkpoint_summary"] = f"{warmstart_kind}; source={source_path or 'none'}; path={path}"
     info = _agillm43_save_pt(state, tmp, codec=ckpt_codec, zstd_level=1)
-    tmp.replace(path)
+    _agillm43_finalize_pt_save(tmp, path, info)
     _write_tokenizer_sidecar(path, {k: state.get(k) for k in ("tokenizer_payload_schema", "tokenizer_id", "tokenizer_json", "tokenizer_bundle", "tokenizer_special", "transformers_version", "tokenizers_version") if state.get(k) is not None})
     if provenance is not None:
         try:
@@ -5805,6 +6506,8 @@ def save_ckpt(path: pathlib.Path, core, ar_h, sat_h, nat_h, opt, scaler, meta, c
     (path.parent / "latest.json").write_text(json.dumps(latest_payload))
     if info.get("codec") == "zstd":
         print(f"\n✓ saved checkpoint {path.name} codec=zstd ratio={info.get('ratio', 0.0):.2f}x")
+    elif info.get("codec") == "block-sharded":
+        print(f"\n✓ saved checkpoint {path.name} codec=block-sharded shards={info.get('shards', 0)} dir={path.name}.shards")
     else:
         print(f"\n✓ saved checkpoint {path.name} codec=raw")
 
@@ -5820,22 +6523,40 @@ def load_ckpt(path, core, ar_h, sat_h, opt, scaler, nat_h=None):
             _load_module_state_compatible(nat_h, ck["nat"], "nat")
         else:
             print("[nat] Checkpoint has no NAT head; keeping fresh NAT initialization")
-    try:
-        opt.load_state_dict(ck["opt"])
-    except Exception as exc:
-        fused_opt = _fuse_legacy_qkv_optimizer_state(ck.get("opt"), opt, core, ar_h, sat_h, nat_h)
-        if fused_opt is not None:
-            try:
-                opt.load_state_dict(fused_opt)
-                print("[ckpt] Converted legacy q/k/v optimizer state to fused qkv layout")
-            except Exception as exc2:
-                print(f"[ckpt] WARNING: optimizer state incompatible; resetting optimizer ({type(exc).__name__}: {exc}; qkv remap failed: {type(exc2).__name__}: {exc2})")
+    opt_state_loaded = False
+    if opt.__class__.__name__ == "PowerStep":
+        print("[ckpt] PowerStep optimizer selected; resetting checkpoint optimizer state")
+    else:
+        opt_state = ck.get("opt")
+        compatible, reason = _optimizer_state_compatibility_reason(opt_state, opt)
+        if not compatible:
+            print(f"[ckpt] WARNING: optimizer state incompatible; resetting optimizer ({reason})")
         else:
-            print(f"[ckpt] WARNING: optimizer state incompatible; resetting optimizer ({type(exc).__name__}: {exc})")
-    try:
-        scaler.load_state_dict(ck["scaler"])
-    except Exception as exc:
-        print(f"[ckpt] WARNING: scaler state incompatible; resetting scaler ({type(exc).__name__}: {exc})")
+            try:
+                opt.load_state_dict(opt_state)
+                opt_state_loaded = True
+            except Exception as exc:
+                fused_opt = _fuse_legacy_qkv_optimizer_state(opt_state, opt, core, ar_h, sat_h, nat_h)
+                if fused_opt is not None:
+                    fused_compatible, fused_reason = _optimizer_state_compatibility_reason(fused_opt, opt)
+                    if fused_compatible:
+                        try:
+                            opt.load_state_dict(fused_opt)
+                            opt_state_loaded = True
+                            print("[ckpt] Converted legacy q/k/v optimizer state to fused qkv layout")
+                        except Exception as exc2:
+                            print(f"[ckpt] WARNING: optimizer state incompatible; resetting optimizer ({type(exc).__name__}: {exc}; qkv remap failed: {type(exc2).__name__}: {exc2})")
+                    else:
+                        print(f"[ckpt] WARNING: fused optimizer state incompatible; resetting optimizer ({fused_reason})")
+                else:
+                    print(f"[ckpt] WARNING: optimizer state incompatible; resetting optimizer ({type(exc).__name__}: {exc})")
+    if opt_state_loaded:
+        try:
+            scaler.load_state_dict(ck["scaler"])
+        except Exception as exc:
+            print(f"[ckpt] WARNING: scaler state incompatible; resetting scaler ({type(exc).__name__}: {exc})")
+    else:
+        print("[ckpt] scaler state reset with optimizer state")
     # Restore tokenizer from checkpoint (embedded json preferred; never raises)
     _restore_tokenizer_from_ckpt(ck, p)
     # Warn if transformers version changed since checkpoint was saved
@@ -5843,7 +6564,11 @@ def load_ckpt(path, core, ar_h, sat_h, opt, scaler, nat_h=None):
         import transformers as _tf
         if ck["transformers_version"] != _tf.__version__:
             print(f"[tokenizer] WARNING: checkpoint saved with transformers={ck['transformers_version']}, now running {_tf.__version__}")
-    return ck.get("step", 0), ck.get("seen_tok", 0), ck.get("wall_time", time.time())
+    step = ck.get("step", 0)
+    seen_tok = ck.get("seen_tok", 0)
+    wall_time = ck.get("wall_time", time.time())
+    _agillm43_release_loaded_checkpoint(ck)
+    return step, seen_tok, wall_time
 
 def _safe_load_any(path: pathlib.Path, tgt: nn.Module, key: str | None = None):
     p = _resolve_ckpt(path) or path
@@ -5871,6 +6596,112 @@ def infer_cfg_from_ckpt(path: pathlib.Path):
     if sd is None: return None
     if "cfg" in sd: return dict(sd["cfg"])
     return None
+
+
+def _infer_cfg_from_delta_checkpoint(sd: dict) -> tuple[dict, bool, str]:
+    """Infer model config for weight-only delta checkpoints.
+
+    Delta checkpoints intentionally omit optimizer/scaler and can omit cfg. Native
+    inference still needs the original architecture. Recover it from provenance
+    when possible, then validate/fill from tensor shapes.
+    """
+    weights = sd.get("weights") or {}
+    core = weights.get("core") or {}
+    ar = weights.get("ar") or {}
+    emb = core.get("emb.weight")
+    if not torch.is_tensor(emb) or emb.ndim != 2:
+        raise ValueError("delta checkpoint missing core emb.weight; cannot infer cfg")
+    d = int(emb.shape[1])
+    layer_ids = []
+    for key in core.keys():
+        if not key.startswith("blocks."):
+            continue
+        parts = key.split(".")
+        if len(parts) > 2 and parts[1].isdigit():
+            layer_ids.append(int(parts[1]))
+    if not layer_ids:
+        raise ValueError("delta checkpoint has no block tensors; cannot infer layer count")
+    layers = max(layer_ids) + 1
+    u = core.get("blocks.0.mha.U")
+    if not torch.is_tensor(u) or u.ndim != 2:
+        raise ValueError("delta checkpoint missing blocks.0.mha.U; cannot infer attention rank")
+    dk = int(u.shape[0])
+    rank = int(u.shape[1])
+    if dk <= 0 or d % dk != 0:
+        raise ValueError(f"delta checkpoint incompatible d/dk: d={d} dk={dk}")
+    heads = d // dk
+
+    prov = sd.get("agillm43_provenance") or {}
+    train_argv = str(prov.get("train_argv") or "") if isinstance(prov, dict) else ""
+    tokens = train_argv.split()
+    preset_name = ""
+    if "--preset" in tokens:
+        idx = tokens.index("--preset")
+        if idx + 1 < len(tokens):
+            preset_name = tokens[idx + 1]
+    if not preset_name:
+        for name in PRESETS.keys():
+            if ("--preset " + name) in train_argv:
+                preset_name = name
+                break
+
+    cfg = None
+    source = "shapes"
+    if preset_name in PRESETS:
+        cand = dict(PRESETS[preset_name])
+        if int(cand.get("d", -1)) == d and int(cand.get("layers", -1)) == layers and int(cand.get("rank", -1)) == rank:
+            cfg = cand
+            source = "provenance:" + preset_name
+    if cfg is None:
+        matches = []
+        for name, cand in PRESETS.items():
+            if int(cand.get("d", -1)) == d and int(cand.get("layers", -1)) == layers and int(cand.get("rank", -1)) == rank:
+                matches.append((name, dict(cand)))
+        if matches:
+            source = "preset:" + matches[0][0]
+            cfg = matches[0][1]
+        else:
+            cfg = {"d": d, "layers": layers, "heads": heads, "rank": rank}
+    cfg["d"] = d
+    cfg["layers"] = layers
+    cfg["heads"] = heads
+    cfg["rank"] = rank
+
+    qkv = core.get("blocks.0.mha.qkv.weight")
+    tie_kv = bool(torch.is_tensor(qkv) and int(qkv.shape[0]) == 2 * d)
+    cfg["tie_kv"] = tie_kv
+
+    router = core.get("blocks.0.ff.router.weight")
+    moe_ffn = torch.is_tensor(router)
+    cfg["moe_ffn"] = bool(moe_ffn)
+    if moe_ffn:
+        cfg["moe_experts"] = int(router.shape[0])
+        cfg["moe_top_k"] = int(cfg.get("moe_top_k", 1) or 1)
+        exp0 = core.get("blocks.0.ff.experts.0.0.weight")
+        if torch.is_tensor(exp0) and exp0.ndim == 2:
+            cfg["moe_mlp_mult"] = max(1, int(exp0.shape[0]) // d)
+        shared_ids = set()
+        for key in core.keys():
+            if not key.startswith("blocks.0.ff.shared."):
+                continue
+            parts = key.split(".")
+            if len(parts) > 4 and parts[4].isdigit():
+                shared_ids.add(int(parts[4]))
+        cfg["moe_shared_experts"] = len(shared_ids)
+        shared0 = core.get("blocks.0.ff.shared.0.0.weight")
+        if torch.is_tensor(shared0) and shared0.ndim == 2:
+            cfg["moe_shared_mlp_mult"] = max(1, int(shared0.shape[0]) // d)
+        else:
+            cfg["moe_shared_mlp_mult"] = int(cfg.get("moe_shared_mlp_mult", 0) or 0)
+
+    ar_weight = ar.get("proj.weight") if isinstance(ar, dict) else None
+    ar_bias = ar.get("proj.bias") if isinstance(ar, dict) else None
+    tie_weights = bool(sd.get("tie_weights", False))
+    if not tie_weights:
+        tie_weights = "--tie_weights" in train_argv
+    if not tie_weights and torch.is_tensor(ar_weight) and tuple(ar_weight.shape) == tuple(emb.shape) and ar_bias is None:
+        tie_weights = True
+    return cfg, tie_weights, source
 
 
 # ───────────────────────── Training Logic ─────────────────────────
@@ -6701,7 +7532,9 @@ def _train_phase(
     ce_tok = nn.CrossEntropyLoss(label_smoothing=0.1)
     ce_gate = nn.CrossEntropyLoss()
     ctc = nn.CTCLoss(blank=BLANK, zero_infinity=True)
-    pbar = SafeProgress(total=total_tokens_needed, initial=seen_tok, unit="tok")
+    pbar = SafeProgress(total=total_tokens_needed, initial=seen_tok, unit="tok", initial_step=start_step)
+    if start_step or seen_tok:
+        print(f"[{phase_name}] resume counters: step={int(start_step)} seen_tok={int(seen_tok)} current_B={int(BATCH)} current_L={int(BLOCK)}", flush=True)
     grow_plan = _parse_grow_plan(args.grow_plan) if args.auto_grow else []
     buf: list[int] = []
     batch_accum: list[list[int]] = []
@@ -6729,12 +7562,30 @@ def _train_phase(
         f"NAT_EVERY={args.nat_every}, TIE_WEIGHTS={tie_weights}, STREAMING={streaming}"
     )
     _flush_flag = [False]
+    _terminate_after_flush = [False]
+
+    def _signal_name(signum):
+        try:
+            return signal.Signals(signum).name
+        except Exception:
+            return str(signum)
+
     def _on_flush_signal(signum, frame):
         _flush_flag[0] = True
-        print(f"\n[{phase_name}] flush signal received; will checkpoint at next step")
+        print(f"\n[{phase_name}] flush signal received ({_signal_name(signum)}); will checkpoint at next step")
+
+    def _on_terminate_signal(signum, frame):
+        _flush_flag[0] = True
+        _terminate_after_flush[0] = True
+        print(f"\n[{phase_name}] {_signal_name(signum)} received; will checkpoint at next step and exit cleanly")
+
     try:
         signal.signal(signal.SIGUSR1, _on_flush_signal)
+        for _term_sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGINT", None), getattr(signal, "SIGHUP", None)):
+            if _term_sig is not None:
+                signal.signal(_term_sig, _on_terminate_signal)
         print(f"[{phase_name}] on-demand flush ready: kill -USR1 {os.getpid()}  or  touch {pathlib.Path(args.save_dir) / 'FLUSH_NOW'}")
+        print(f"[{phase_name}] graceful termination flush ready: SIGTERM/SIGINT/SIGHUP will save a checkpoint then exit")
     except (ValueError, OSError):
         pass
     _DBS = _dblock_init(core, args) if getattr(args,'dblock',False) else None
@@ -7067,6 +7918,10 @@ def _train_phase(
             last_delta_step = step
             last_delta_mono = time.monotonic()
             print(f"[{phase_name}] ON-DEMAND flush saved {_ck_name} at step {step}")
+            if _terminate_after_flush[0]:
+                setattr(args, "_agillm_terminate_after_flush", True)
+                print(f"[{phase_name}] termination checkpoint complete; stopping training loop cleanly", flush=True)
+                return step, seen_tok, time.time()
         _save_sec = get_hot_config().get("save_every_sec", args.save_every_sec)
         try: _save_sec = float(_save_sec)
         except Exception: _save_sec = args.save_every_sec
@@ -7245,7 +8100,11 @@ def train(args):
         print(f"{Colors.WARN}[weight-tying] Embedding and {head_names} vocab projections share one tensor (VRAM-first){Colors.RESET}")
     _agillm_provenance_cache = None
     _agillm_loaded_source_path = ""
-    if not args.fresh:
+    resume_source_requested = bool(getattr(args, "resume_delta", None) or getattr(args, "resume", None))
+    # Full resume and resume-delta paths load their exact source below. Avoid an
+    # extra best-guess warm-start here; it double-loads multi-GB checkpoints and
+    # can trip the 32GB Vast container memory limit before training starts.
+    if not args.fresh and (getattr(args, "warmstart_from", None) or not resume_source_requested):
         src = pathlib.Path(args.warmstart_from) if args.warmstart_from else pathlib.Path(args.save_dir) / "final.pt"
         src = _resolve_ckpt(src)
         if src:
@@ -7261,8 +8120,8 @@ def train(args):
                 _agillm_provenance_cache = _agillm_provenance.extract(src)
             else:
                 _agillm_provenance_cache = None
-    if not _agillm_loaded_source_path and (getattr(args, "warmstart_from", None) or getattr(args, "resume", None)):
-        _agillm_loaded_source_path = str(getattr(args, "warmstart_from", None) or getattr(args, "resume", None))
+    if not _agillm_loaded_source_path and (getattr(args, "warmstart_from", None) or getattr(args, "resume", None) or getattr(args, "resume_delta", None)):
+        _agillm_loaded_source_path = str(getattr(args, "warmstart_from", None) or getattr(args, "resume", None) or getattr(args, "resume_delta", None))
     _agillm_lineage = _agillm43_lineage_info(_agillm_loaded_source_path, _agillm_provenance_cache, args.save_dir)
     print(
         f"[lineage] warmstart_kind={_agillm_lineage.get('warmstart_kind')} "
@@ -7322,6 +8181,9 @@ def train(args):
         lineage=_agillm_lineage,
         provenance_cache=_agillm_provenance_cache
     )
+    if getattr(args, "_agillm_terminate_after_flush", False):
+        print("[train] graceful termination after checkpoint; skipping final.pt duplicate", flush=True)
+        return
     if (not args.after_sft_source) and (args.after_sft_steps and args.after_sft_steps > 0):
         args.after_sft_source = DEFAULT_AFTER_SFT_SOURCES
         args.after_sft_chat = True
@@ -7361,6 +8223,9 @@ def train(args):
             lineage=_agillm_lineage,
             provenance_cache=_agillm_provenance_cache
         )
+        if getattr(args, "_agillm_terminate_after_flush", False):
+            print("[train] graceful termination after checkpoint; skipping final.pt duplicate", flush=True)
+            return
     final_effective_source = get_hot_datasets(args.source)
     final_dataset_meta = _dataset_provenance("final", args.source, final_effective_source, args)
     _prov = _agillm_provenance.collect(args,
@@ -7546,6 +8411,30 @@ def _block_stream_dtype(args):
 def _infer_dtype(args):
     return _dtype_from_arg(args, "infer_dtype", "--infer_dtype")
 
+
+
+def _modules_have_dtype(modules, dtype) -> bool:
+    if dtype is None:
+        return True
+    for module in modules:
+        if module is None:
+            continue
+        for tensor in module.parameters(recurse=True):
+            if tensor.dtype != dtype:
+                return False
+        for tensor in module.buffers(recurse=True):
+            if tensor.dtype != dtype:
+                return False
+    return True
+
+
+def _cast_modules_dtype(modules, dtype) -> bool:
+    if dtype is None or _modules_have_dtype(modules, dtype):
+        return False
+    for module in modules:
+        if module is not None:
+            module.to(dtype=dtype)
+    return True
 
 def _block_stream_empty_cache(args) -> bool:
     return bool(getattr(args, "block_stream_empty_cache", True)) and torch.cuda.is_available()
@@ -7816,7 +8705,7 @@ def _dblock_euler_hidden(core, ids, args):
 
 
 @torch.no_grad()
-def infer(args):
+def _agillm43_prepare_infer_instance(args):
     global DEV
     _requested_device = getattr(args, "device", "auto")
     _effective_device = _requested_device
@@ -7873,7 +8762,10 @@ def infer(args):
     if args.mode == "sat":
         min_new = max(min_new, SAT_BLOCK)
     path = _resolve_ckpt(pathlib.Path(args.ckpt)) or pathlib.Path(args.ckpt)
-    sd = _agillm43_load_pt(path, map_location="cpu", weights_only=False)
+    _t_stage = time.perf_counter()
+    sd = _agillm43_load_pt(path, map_location="cpu", weights_only=False, skip_keys={"opt", "scaler"})
+    print(f"[load-profile] checkpoint_load={time.perf_counter() - _t_stage:.1f}s", flush=True)
+    _t_stage = time.perf_counter()
     # Inference never needs optimizer/scaler state. Drop it before model construction
     # so block-stream runs keep CPU RAM pressure lower after checkpoint load.
     if isinstance(sd, dict):
@@ -7883,22 +8775,26 @@ def infer(args):
         _gc.collect()
     # Restore tokenizer from checkpoint (embedded json preferred; never raises)
     _restore_tokenizer_from_ckpt(sd, path)
+    print(f"[load-profile] tokenizer_restore={time.perf_counter() - _t_stage:.1f}s", flush=True)
     # Warn if transformers version changed since checkpoint was saved
     if "transformers_version" in sd:
         import transformers as _tf
         if sd["transformers_version"] != _tf.__version__:
             print(f"[tokenizer] WARNING: checkpoint saved with transformers={sd['transformers_version']}, now running {_tf.__version__}")
-    # Handle delta checkpoints (weight-only, no cfg)
+    # Handle delta checkpoints (weight-only, often no cfg)
     if sd.get("delta"):
-        print("[infer] Delta checkpoint detected, using large preset cfg")
-        cfg = PRESETS["large"].copy()
-        tie_weights = False
+        cfg, tie_weights, cfg_source = _infer_cfg_from_delta_checkpoint(sd)
+        print("[infer] Delta checkpoint detected, cfg_source=%s d=%s layers=%s heads=%s rank=%s tie_kv=%s moe_ffn=%s tie_weights=%s" % (
+            cfg_source, cfg.get("d"), cfg.get("layers"), cfg.get("heads"), cfg.get("rank"),
+            bool(cfg.get("tie_kv", False)), bool(cfg.get("moe_ffn", False)), bool(tie_weights),
+        ), flush=True)
+        weights = sd.get("weights") or {}
         # Remap: delta stores under sd["weights"]["core"/"ar"/"sat"/"nat"]
-        sd["core"] = sd["weights"]["core"]
-        sd["ar"]   = sd["weights"]["ar"]
-        sd["sat"]  = sd["weights"]["sat"]
-        if "nat" in sd["weights"]:
-            sd["nat"] = sd["weights"]["nat"]
+        sd["core"] = weights["core"]
+        sd["ar"] = weights["ar"]
+        sd["sat"] = weights["sat"]
+        if "nat" in weights:
+            sd["nat"] = weights["nat"]
     else:
         cfg = sd["cfg"]
         tie_weights = sd.get("tie_weights", False)
@@ -7919,50 +8815,69 @@ def infer(args):
         print(f"│ Checkpoint: {ckpt_name:<35s} │")
         print(f"└─────────────────────────────────────────────────┘")
     print_expansion_info(cfg, tie_weights, plain=plain_output)
+    _t_stage = time.perf_counter()
     block_stream = _block_stream_enabled(args)
     infer_dtype = None if block_stream else _infer_dtype(args)
+    preload_dtype = _block_stream_dtype(args) if block_stream else infer_dtype
     resident_dtype = (infer_dtype is not None and not block_stream)
     core_device = torch.device("cpu") if (block_stream or resident_dtype) else DEV
-    core = Encoder(
-        cfg,
-        tie_weights=tie_weights,
-        attn_backend=args.attn_backend,
-        sublinear_window=args.sublinear_window,
-        sublinear_stride=args.sublinear_stride,
-        sublinear_max_anchors=args.sublinear_max_anchors,
-        sublinear_chunk=args.sublinear_chunk,
-        sublinear_sinks=args.sublinear_sinks,
-        sublinear_recent_anchors=args.sublinear_recent_anchors,
-        sublinear_pooled_landmarks=args.sublinear_pooled_landmarks,
-        anchor_memory=getattr(args, "anchor_memory", DEFAULT_ANCHOR_MEMORY),
-        anchor_stride=getattr(args, "anchor_stride", DEFAULT_ANCHOR_STRIDE),
-        anchor_max=getattr(args, "anchor_max", DEFAULT_ANCHOR_MAX),
-        anchor_position=getattr(args, "anchor_position", DEFAULT_ANCHOR_POSITION),
-    ).to(core_device)
-    head_device = torch.device("cpu") if resident_dtype else DEV
-    ar_h = ARHead(cfg["d"], tie_weights=tie_weights, embedding_weight=core.emb.weight if tie_weights else None).to(head_device)
-    sat_head_mlp = bool(sd.get("sat_head_mlp", False) or _sat_head_mlp_from_state(sd))
-    sat_h = SATHead(cfg["d"], mlp=sat_head_mlp, tie_weights=tie_weights, embedding_weight=core.emb.weight if tie_weights else None).to(head_device)
-    nat_h = NATHead(cfg["d"], tie_weights=tie_weights, embedding_weight=core.emb.weight if tie_weights else None).to(head_device) if ("nat" in sd or args.mode == "nat") else None
+    old_default_dtype = torch.get_default_dtype()
+    if preload_dtype is not None:
+        torch.set_default_dtype(preload_dtype)
+    try:
+        with _skip_param_init():
+            core = Encoder(
+                cfg,
+                tie_weights=tie_weights,
+                attn_backend=args.attn_backend,
+                sublinear_window=args.sublinear_window,
+                sublinear_stride=args.sublinear_stride,
+                sublinear_max_anchors=args.sublinear_max_anchors,
+                sublinear_chunk=args.sublinear_chunk,
+                sublinear_sinks=args.sublinear_sinks,
+                sublinear_recent_anchors=args.sublinear_recent_anchors,
+                sublinear_pooled_landmarks=args.sublinear_pooled_landmarks,
+                anchor_memory=getattr(args, "anchor_memory", DEFAULT_ANCHOR_MEMORY),
+                anchor_stride=getattr(args, "anchor_stride", DEFAULT_ANCHOR_STRIDE),
+                anchor_max=getattr(args, "anchor_max", DEFAULT_ANCHOR_MAX),
+                anchor_position=getattr(args, "anchor_position", DEFAULT_ANCHOR_POSITION),
+            ).to(core_device)
+            print(f"[load-profile] encoder_construct={time.perf_counter() - _t_stage:.1f}s", flush=True)
+            _t_stage = time.perf_counter()
+            head_device = torch.device("cpu") if resident_dtype else DEV
+            ar_h = ARHead(cfg["d"], tie_weights=tie_weights, embedding_weight=core.emb.weight if tie_weights else None).to(head_device)
+            sat_head_mlp = bool(sd.get("sat_head_mlp", False) or _sat_head_mlp_from_state(sd))
+            sat_h = SATHead(cfg["d"], mlp=sat_head_mlp, tie_weights=tie_weights, embedding_weight=core.emb.weight if tie_weights else None).to(head_device)
+            nat_h = NATHead(cfg["d"], tie_weights=tie_weights, embedding_weight=core.emb.weight if tie_weights else None).to(head_device) if ("nat" in sd or args.mode == "nat") else None
+    finally:
+        torch.set_default_dtype(old_default_dtype)
+    _reinit_params_missing_from_state(core, sd["core"] if isinstance(sd.get("core"), dict) else {})
     _maybe_register_looped_infer(core, sd, args)
+    print(f"[load-profile] heads_construct={time.perf_counter() - _t_stage:.1f}s", flush=True)
+    _t_stage = time.perf_counter()
+    if preload_dtype is not None:
+        if not _cast_modules_dtype((core, ar_h, sat_h, nat_h), preload_dtype):
+            print(f"[infer] preload_dtype already={str(preload_dtype).replace('torch.', '')}", flush=True)
+    print(f"[load-profile] preload_dtype_cast={time.perf_counter() - _t_stage:.1f}s", flush=True)
+    _t_stage = time.perf_counter()
     core.load_state_dict(_prepare_core_state_dict_for_load(core, sd["core"]))
+    print(f"[load-profile] core_state_load={time.perf_counter() - _t_stage:.1f}s", flush=True)
+    _t_stage = time.perf_counter()
     ar_h.load_state_dict(sd["ar"])
     _load_infer_head_state(sat_h, sd["sat"], "SATHead")
     if nat_h is not None:
         if "nat" not in sd:
             raise ValueError("NAT inference requested, but this checkpoint has no NAT head")
         _load_infer_head_state(nat_h, sd["nat"], "NATHead")
+    print(f"[load-profile] head_state_load={time.perf_counter() - _t_stage:.1f}s", flush=True)
+    _t_stage = time.perf_counter()
     core.eval()
     ar_h.eval()
     sat_h.eval()
     if nat_h is not None:
         nat_h.eval()
     if resident_dtype:
-        core.to(dtype=infer_dtype)
-        ar_h.to(dtype=infer_dtype)
-        sat_h.to(dtype=infer_dtype)
-        if nat_h is not None:
-            nat_h.to(dtype=infer_dtype)
+        _cast_modules_dtype((core, ar_h, sat_h, nat_h), infer_dtype)
         core.to(DEV)
         ar_h.to(DEV)
         sat_h.to(DEV)
@@ -7972,11 +8887,7 @@ def infer(args):
     if block_stream:
         stream_dtype = _block_stream_dtype(args)
         if stream_dtype is not None:
-            core.to(dtype=stream_dtype)
-            ar_h.to(dtype=stream_dtype)
-            sat_h.to(dtype=stream_dtype)
-            if nat_h is not None:
-                nat_h.to(dtype=stream_dtype)
+            _cast_modules_dtype((core, ar_h, sat_h, nat_h), stream_dtype)
             print(f"[infer] block_stream_dtype={str(stream_dtype).replace('torch.', '')}")
         core.emb.to(DEV)
         core.ln.to(DEV)
@@ -8000,6 +8911,7 @@ def infer(args):
         print(f"[infer] block_stream=True device={DEV} page={page_desc}{moe_desc};{page_cache_desc}{kv_desc}")
         if _moe_expert_stream_enabled(args):
             _moe_expert_stream_reset_stats(core)
+    print(f"[load-profile] device_placement={time.perf_counter() - _t_stage:.1f}s", flush=True)
     total_params = _count_enabled_params(core, ar_h, sat_h, nat_h)
     if total_params >= 1_000_000_000:
         param_str = f"{total_params / 1_000_000_000:.2f}B"
@@ -8010,6 +8922,43 @@ def infer(args):
     else:
         param_str = f"{total_params}"
     print(f"Model size: {param_str} parameters ({total_params:,})")
+    try:
+        del sd
+        import gc as _gc
+        _gc.collect()
+    except Exception:
+        pass
+    return {
+        "path": path,
+        "cfg": cfg,
+        "tie_weights": tie_weights,
+        "plain_output": plain_output,
+        "block_stream": block_stream,
+        "resident_dtype": resident_dtype,
+        "core": core,
+        "ar_h": ar_h,
+        "sat_h": sat_h,
+        "nat_h": nat_h,
+    }
+
+
+@torch.no_grad()
+def _agillm43_generate_from_instance(inst, args):
+    global DEV
+    core = inst["core"]
+    ar_h = inst["ar_h"]
+    sat_h = inst["sat_h"]
+    nat_h = inst["nat_h"]
+    block_stream = bool(inst.get("block_stream", False))
+    resident_dtype = bool(inst.get("resident_dtype", False))
+    plain_output = (
+        bool(getattr(args, "plain_output", False))
+        or bool(getattr(args, "claude_friendly", False))
+        or not sys.stdout.isatty()
+    )
+    min_new = int(getattr(args, "min_new", 0) or 0)
+    if args.mode == "sat":
+        min_new = max(min_new, SAT_BLOCK)
     prompt_tokens = tok.encode(args.prompt)
     prompt_len = len(prompt_tokens)
     ids = torch.tensor([prompt_tokens], device=DEV)
@@ -8103,8 +9052,13 @@ def infer(args):
             logits = nat_h(h).float()
             logits[..., BLANK] = -1e9
             conf = logits.softmax(-1).amax(-1)
-            k = max(1, -(-len(remaining) // (passes - p)))
-            ordered = sorted(remaining, key=lambda q: float(conf[0, q]), reverse=True)[:k]
+            k_min = max(1, -(-len(remaining) // (passes - p)))
+            conf_threshold = getattr(args, "nat_conf_threshold", 0.9)
+            confident_positions = [q for q in remaining if float(conf[0, q]) > conf_threshold]
+            if len(confident_positions) > k_min:
+                ordered = sorted(confident_positions, key=lambda q: float(conf[0, q]), reverse=True)
+            else:
+                ordered = sorted(remaining, key=lambda q: float(conf[0, q]), reverse=True)[:k_min]
             for pos in ordered:
                 nxt = _nat_pick(logits[:, pos, :], ids)
                 ids[0, pos] = int(nxt.reshape(-1)[0])
@@ -8237,6 +9191,50 @@ def infer(args):
         print(f"{claude_prompt}{claude_gen}")
         print(f"[stats] {elapsed:.2f}s | {gen_tokens} tokens | {tok_per_sec:.1f} tok/s")
         print("[CLAUDE_FRIENDLY_END]")
+
+
+@torch.no_grad()
+def infer(args):
+    inst = _agillm43_prepare_infer_instance(args)
+    return _agillm43_generate_from_instance(inst, args)
+
+
+@torch.no_grad()
+def infer_server(args):
+    # AGILLM-WARM-SERVER-PORT 20260703: keep one loaded checkpoint/model alive for many stdin JSON prompts.
+    args.plain_output = True
+    inst = _agillm43_prepare_infer_instance(args)
+    print("[INFER_SERVER_READY]", flush=True)
+    request_fields = {
+        "prompt", "mode", "max_new", "min_new", "temperature", "top_k", "top_p",
+        "min_p", "greedy", "ignore_eos", "nat_passes", "nat_greedy", "nat_conf_threshold",
+        "var", "repetition_penalty", "presence_penalty", "frequency_penalty", "penalty_last_n",
+        "claude_friendly", "sampler", "euler_steps", "euler_start_sigma", "dblock_blocks",
+        "swi_reasoning", "swi_latent_thresh", "swi_explicit_thresh", "swi_eps",
+        "swi_max_switches", "swi_max_latent", "swi_think_budget", "swi_max_steps",
+        "swi_topk", "swi_start_latent", "block_stream", "block_stream_kv_cache",
+        "block_stream_kv_device", "block_stream_cache_pages", "moe_expert_stream",
+    }
+    for raw_line in sys.stdin:
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        try:
+            req = json.loads(raw_line)
+            if str(req.get("cmd", "infer")).lower() in {"quit", "exit", "stop"}:
+                print("[INFER_SERVER_STOPPING]", flush=True)
+                break
+            run_args = copy.copy(args)
+            for key, value in req.items():
+                if key in request_fields:
+                    setattr(run_args, key, value)
+            run_args.plain_output = True
+            print("[INFER_SERVER_RESULT_START]", flush=True)
+            _agillm43_generate_from_instance(inst, run_args)
+            print("[INFER_SERVER_RESULT_END]", flush=True)
+        except Exception as exc:
+            print(f"[INFER_SERVER_ERROR] {type(exc).__name__}: {exc}", flush=True)
+            print("[INFER_SERVER_RESULT_END]", flush=True)
 
 
 # ───────────────────────── CLI ─────────────────────────
@@ -8413,7 +9411,7 @@ def _agillm43_prune_save_dir(save_dir):
             tmp.unlink()
         except Exception:
             pass
-    ckpts = sorted(d.glob("pretrain_step*.pt"), key=lambda x: x.stat().st_mtime, reverse=True)
+    ckpts = sorted([p for p in d.glob("pretrain_step*.pt") if not p.name.endswith(".resume_delta.pt")], key=lambda x: x.stat().st_mtime, reverse=True)
     for old in ckpts[1:]:
         try:
             old.unlink()
@@ -8434,7 +9432,7 @@ def _agillm43_latest_checkpoint_path(save_dir):
         src = ""
     if src and Path(src).exists():
         return str(Path(src))
-    candidates = sorted(glob.glob(str(save / "pretrain_step*.pt")), key=os.path.getmtime)
+    candidates = sorted([p for p in glob.glob(str(save / "pretrain_step*.pt")) if not str(p).endswith(".resume_delta.pt")], key=os.path.getmtime)
     return candidates[-1] if candidates else ""
 
 
@@ -8522,7 +9520,7 @@ def _agillm43_convert_resume_delta(save_dir, log_path):
     return str(out)
 
 
-AGILLM43_PROFILE_CHOICES = ("normal", "ar_repair", "full_ar_repair", "sat_repair", "sat_probe")
+AGILLM43_PROFILE_CHOICES = ("normal", "ar_repair", "full_ar_repair", "sat_repair", "sat_probe", "nat_repair")
 
 
 def _agillm43_profile_config(profile):
@@ -8560,6 +9558,14 @@ def _agillm43_profile_config(profile):
             "ar_loss_tokens": "256", "sat_loss_tokens": "2048", "nat_loss_tokens": "256",
             "sat_every": "1", "nat_every": "4",
         },
+        "nat_repair": {
+            # Recovery profile for post-fix NAT training: keep AR/SAT alive, but
+            # give NAT enough objective incidence and dense token coverage to catch up.
+            "ar_prob": "0.45", "sat_prob": "0.25", "nat_prob": "0.30",
+            "ar_loss_tokens": "512", "sat_loss_tokens": "1024", "nat_loss_tokens": "4096",
+            "sat_every": "1", "nat_every": "1", "nat_loss_weight": "1.0",
+            "nat_span_mask_prob": "0.45", "nat_suffix_mask_prob": "0.35",
+        },
     }
     if profile not in profiles:
         raise ValueError(f"unknown AGILLM4.3 profile {profile!r}; choose one of {', '.join(AGILLM43_PROFILE_CHOICES)}")
@@ -8586,6 +9592,7 @@ def _agillm43_train_argv(save_dir, side_dir, resume_delta, profile="normal", war
         "--dblock_sigma_sampling", "lognormal", "--dblock_sigma_stratified",
         "--dblock_log_every", "25", "--dblock_objective_mode", "stochastic",
         "--dblock_ar_prob", prof["ar_prob"], "--dblock_sat_prob", prof["sat_prob"], "--dblock_nat_prob", prof["nat_prob"],
+        "--nat_loss_weight", prof.get("nat_loss_weight", "1.0"),
         "--dblock_ar_loss_tokens", prof["ar_loss_tokens"], "--dblock_sat_loss_tokens", prof["sat_loss_tokens"], "--dblock_nat_loss_tokens", prof["nat_loss_tokens"],
         "--moe_ffn", "--moe_experts", "2", "--moe_top_k", "1", "--moe_mlp_mult", "4",
         "--moe_shared_experts", "1", "--moe_shared_mlp_mult", "2", "--moe_aux_coef", "0.01", "--moe_z_coef", "0.001",
@@ -8597,7 +9604,7 @@ def _agillm43_train_argv(save_dir, side_dir, resume_delta, profile="normal", war
         "--dblock_checkpoint_stride", "1", "--optimizer", "adamw8bit",
         "--loss_spike_skip", "3.0", "--sat_every", prof["sat_every"], "--nat_every", prof["nat_every"],
         *(["--lr_core", prof["lr_core"], "--lr_head", prof["lr_head"]] if "lr_core" in prof and "lr_head" in prof else []),
-        "--nat_max_tokens", "768", "--nat_mask_ratio", "0.5", "--token_param_ratio", "55",
+        "--nat_max_tokens", "768", "--nat_mask_ratio", "0.5", "--nat_span_mask_prob", prof.get("nat_span_mask_prob", "0.35"), "--nat_suffix_mask_prob", prof.get("nat_suffix_mask_prob", "0.20"), "--token_param_ratio", "55",
         "--val_tokens", "32768", "--val_every_sec", "3600", "--val_source", "json:/workspace/agillm_math_numeracy_synth/train.jsonl", "--data_seed", "-1",
         "--save_dir", str(save_dir), "--save_every_sec", prof.get("save_every_sec", "14400"), "--heartbeat_every_sec", "300",
         "--empty_cache_every_steps", "0", "--delta_every_steps", "0", "--delta_every_sec", str(DEFAULT_DELTA_SEC), "--delta_max_keep", "1", "--max_ckpts", "1",
@@ -8850,9 +9857,9 @@ def main():
     tr.add_argument("--delta_every_sec", type=int, default=DEFAULT_DELTA_SEC, help="Weight-only delta save every N seconds (0=off)")
     tr.add_argument("--delta_max_keep", type=int, default=DEFAULT_MAX_DELTAS, help="Max delta checkpoints to keep")
     tr.add_argument("--delta_codec", default=os.environ.get("AGILLM43_DELTA_CODEC", "zstd3"),
-                    help="Delta checkpoint payload codec: off/raw, zstd, or zstdN such as zstd3. zstd modes are lossless and accepted by load_delta.")
+                    help="Delta checkpoint payload codec: off/raw, zstd/zstdN, or block-sharded-zstd. Sharded mode writes a manifest plus independently loadable shards.")
     tr.add_argument("--ckpt_codec", default=os.environ.get("AGILLM43_CKPT_CODEC", "zstd3"),
-                    help="Full checkpoint payload codec: off/raw, zstd, or zstdN such as zstd3. zstd modes are lossless and accepted by load_ckpt, infer, and resume-delta conversion.")
+                    help="Full checkpoint payload codec: off/raw, zstd/zstdN, or block-sharded-zstd. Sharded mode writes a manifest plus per-block/head shards and is accepted by load_ckpt, infer, and resume-delta conversion.")
     tr.add_argument("--resume_delta", type=str, help="Resume from a delta (weight-only, no optimizer state)")
     tr.add_argument("--async_update_dir", default="",
                     help="Optional incoming directory for verified DBlock side updates. Empty disables async side updates.")
@@ -9046,7 +10053,7 @@ def main():
                      help="CPU inference intra-op threads. 0=auto, capped at 16; only used when --device resolves to cpu.")
     inf.add_argument("--cpu_interop_threads", type=int, default=0,
                      help="CPU inference inter-op threads. 0=PyTorch default; only used when --device resolves to cpu.")
-    inf.add_argument("--prompt", required=True)
+    inf.add_argument("--prompt", default="", help="Prompt text for single-shot inference; optional when --server is set.")
     inf.add_argument("--max_new", type=int, default=120)
     inf.add_argument("--min_new", type=int, default=0, help="Minimum generated tokens before EOS can stop decoding. SAT enforces at least one block.")
     inf.add_argument("--temperature", type=float, default=None)
@@ -9099,6 +10106,7 @@ def main():
                      help="Top-k mass to use for the soft thought embedding in latent steps.")
     inf.add_argument("--swi_start_latent", action="store_true",
                      help="Begin in latent mode instead of explicit (starts silent).")
+    # AGILLM-INFER-SPEED-PORT 20260703: checkpoint cache, skip-init, dtype-cast guard, and load-profile timings.
     inf.add_argument("--infer_dtype", choices=["fp32", "fp16", "bf16"], default="fp32",
                      help="Resident inference dtype. fp16/bf16 load on CPU, convert, then move the model to CUDA to avoid fp32 VRAM spikes.")
     inf.add_argument("--block_stream", action="store_true",
@@ -9119,6 +10127,8 @@ def main():
                      help="With --block_stream, keep routed MoE experts on CPU and page only selected experts through the compute device.")
     inf.add_argument("--moe_expert_stream_empty_cache", action=argparse.BooleanOptionalAction, default=True,
                      help="Call torch.cuda.empty_cache() after unloading each streamed MoE expert.")
+    inf.add_argument("--server", action="store_true",
+                     help="Keep one loaded inference instance alive and accept JSON requests on stdin.")
     sup = sub.add_parser("supervise", help="Native AGILLM4.3 trainer supervisor")
     sup.add_argument("--save_dir", default="/workspace/agillm4_4090_ckpts")
     sup.add_argument("--side_dir", default="/workspace/agillm41_side_updates")
@@ -9128,7 +10138,7 @@ def main():
     sup.add_argument("--dedupe", action=argparse.BooleanOptionalAction, default=True)
     sup.add_argument("--once", action="store_true")
     sup.add_argument("--profile", choices=AGILLM43_PROFILE_CHOICES, default="normal",
-                     help="Training launch profile: normal, ar_repair, full_ar_repair, sat_repair, or sat_probe.")
+                     help="Training launch profile: normal, ar_repair, full_ar_repair, sat_repair, sat_probe, or nat_repair.")
     hp = sub.add_parser("hotpatch", help="Flush checkpoint and restart under native AGILLM4.3 supervisor")
     hp.add_argument("--save_dir", default="/workspace/agillm4_4090_ckpts")
     hp.add_argument("--side_dir", default="/workspace/agillm41_side_updates")
@@ -9150,7 +10160,10 @@ def main():
     st.add_argument("--save_dir", type=str, default=str(STATUS_DEFAULT_SAVE_DIR))
     args = ap.parse_args()
     if args.cmd == "train": train(args)
-    elif args.cmd == "infer": infer(args)
+    elif args.cmd == "infer":
+        if not getattr(args, "server", False) and not getattr(args, "prompt", ""):
+            ap.error("infer requires --prompt unless --server is set")
+        infer_server(args) if getattr(args, "server", False) else infer(args)
     elif args.cmd == "supervise": raise SystemExit(supervise_agillm43(args))
     elif args.cmd == "hotpatch": raise SystemExit(hotpatch_agillm43(args))
     elif args.cmd == "status": raise SystemExit(_emit_status(Path(args.log), Path(args.save_dir), args.json_output))
