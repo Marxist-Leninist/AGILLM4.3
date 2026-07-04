@@ -2376,6 +2376,115 @@ DEFAULT_LANGUAGE_PRETRAIN_SOURCES = os.environ.get(
 )
 _hot_config_cache = {"mtime": 0, "data": {}}
 
+AR_NAT_SAT_FORCE_TOKEN = "I_ACCEPT_DISABLING_AR_NAT_SAT_HEADS"
+_AR_NAT_SAT_SAFE_FLOATS = {
+    "dblock_sat_prob": 0.25,
+    "dblock_nat_prob": 0.30,
+    "dblock_sat_weight": 1.0,
+    "dblock_nat_weight": 1.0,
+    "nat_loss_weight": 1.0,
+}
+_AR_NAT_SAT_SAFE_LOSS_TOKENS = {
+    "sat": 1024,
+    "nat": 4096,
+}
+_ar_nat_sat_guard_seen = set()
+
+
+def _ar_nat_sat_force_override_ok(cfg: dict) -> bool:
+    if not isinstance(cfg, dict):
+        return False
+    try:
+        until = float(cfg.get("force_ar_nat_sat_override_until_unix") or 0.0)
+    except Exception:
+        until = 0.0
+    if cfg.get("force_ar_nat_sat_override") != AR_NAT_SAT_FORCE_TOKEN:
+        return False
+    if until <= time.time() or until - time.time() > 7200:
+        return False
+    return bool(str(cfg.get("force_ar_nat_sat_override_by") or "").strip()) and bool(str(cfg.get("force_ar_nat_sat_override_reason") or "").strip())
+
+
+def _ar_nat_sat_guard_reason() -> str:
+    return (
+        "AR+SAT+NAT must all stay active: SAT/NAT are separate trained inference heads, "
+        "zeroing them starves those heads and can rot the fast inference modes; "
+        "a previous AR-only recovery experiment worsened validation CE. "
+        f"To force a short diagnostic override, set force_ar_nat_sat_override={AR_NAT_SAT_FORCE_TOKEN!r}, "
+        "force_ar_nat_sat_override_by, force_ar_nat_sat_override_reason, and "
+        "force_ar_nat_sat_override_until_unix (<=2h)."
+    )
+
+
+def _ar_nat_sat_guard_float(cfg: dict, attr: str, value: float) -> float:
+    if attr not in _AR_NAT_SAT_SAFE_FLOATS or value > 0.0 or _ar_nat_sat_force_override_ok(cfg):
+        return value
+    fallback = float(_AR_NAT_SAT_SAFE_FLOATS[attr])
+    key = (attr, fallback)
+    if key not in _ar_nat_sat_guard_seen:
+        _ar_nat_sat_guard_seen.add(key)
+        print(f"[hot_config][GUARD] Refusing {attr}={value}; using {fallback}. {_ar_nat_sat_guard_reason()}", flush=True)
+    return fallback
+
+
+def _ar_nat_sat_guard_loss_tokens(cfg: dict, objective: str, value: int) -> int:
+    obj = str(objective or "").strip().lower()
+    if obj not in _AR_NAT_SAT_SAFE_LOSS_TOKENS or value > 0 or _ar_nat_sat_force_override_ok(cfg):
+        return value
+    fallback = int(_AR_NAT_SAT_SAFE_LOSS_TOKENS[obj])
+    key = (f"{obj}_loss_tokens", fallback)
+    if key not in _ar_nat_sat_guard_seen:
+        _ar_nat_sat_guard_seen.add(key)
+        print(f"[hot_config][GUARD] Refusing dblock_{obj}_loss_tokens={value}; using {fallback}. {_ar_nat_sat_guard_reason()}", flush=True)
+    return fallback
+
+# AGILLM-OBJECTIVE-GUARD 20260704: owner directive (Scott) — AR+NAT+SAT ALWAYS.
+# On 2026-07-03 agents hot-tuned the objective mix to AR-only (nat/sat prob 0)
+# chasing a val-CE regression; the run diverged to ppl 4.7M and needed a
+# rollback+restart. Zeroing a head also silently rots the NAT/SAT inference
+# modes. Any dblock_*_prob below OBJECTIVE_PROB_FLOOR is clamped with a loud
+# warning unless the 4-field force_ar_nat_sat_override contract (below) is
+# satisfied — ONE override mechanism for both guard layers.
+OBJECTIVE_PROB_FLOOR = 0.05
+_objective_guard_warned = {}
+
+
+def _guard_objective_mix(cfg: dict) -> dict:
+    # Defers to the same force_ar_nat_sat_override contract as the >0 guard
+    # helpers above (token + by + reason + expiry <=2h) — a single override
+    # mechanism so agents never satisfy one guard and get blocked by another.
+    if not isinstance(cfg, dict) or _ar_nat_sat_force_override_ok(cfg):
+        return cfg
+    for key in ("dblock_ar_prob", "dblock_sat_prob", "dblock_nat_prob"):
+        val = cfg.get(key)
+        if val is None:
+            continue
+        try:
+            val = float(val)
+        except (TypeError, ValueError):
+            continue
+        if val < OBJECTIVE_PROB_FLOOR:
+            cfg = dict(cfg)
+            cfg[key] = OBJECTIVE_PROB_FLOOR
+            if _objective_guard_warned.get(key) != val:
+                _objective_guard_warned[key] = val
+                print(
+                    f"[hot_config] *** OBJECTIVE GUARD *** {key}={val} BLOCKED, clamped to {OBJECTIVE_PROB_FLOOR}.\n"
+                    f"[hot_config]   WHY (owner policy, Scott): AGILLM4.3 is one shared trunk with THREE decode heads;\n"
+                    f"[hot_config]   AR, SAT and NAT are all product surfaces (AR=quality, SAT~13 tok/s, NAT 150+ tok/s serving).\n"
+                    f"[hot_config]   Zeroing a head freezes its weights while the trunk keeps moving under the other\n"
+                    f"[hot_config]   objectives -> that head rots and its inference mode degrades until retrained.\n"
+                    f"[hot_config]   Evidence 2026-07-03: agents thrashed the mix to AR-only chasing a val-CE regression;\n"
+                    f"[hot_config]   it fixed nothing (divergence was weight-level, val CE 11->15.4, ppl 4.7M, needed a\n"
+                    f"[hot_config]   rollback+restart) and risked rotting NAT/SAT. The 270k-step stable history all ran\n"
+                    f"[hot_config]   on the mixed objective. If you have a genuinely good reason (e.g. brief diagnostic),\n"
+                    f"[hot_config]   use the force_ar_nat_sat_override contract (token + _by + _reason + _until_unix <=2h)\n"
+                    f"[hot_config]   AND announce it on the SG training channel first.",
+                    flush=True,
+                )
+    return cfg
+
+
 def get_hot_config() -> dict:
     """Load hot_config.json with caching, return empty dict if missing"""
     try:
@@ -2383,7 +2492,7 @@ def get_hot_config() -> dict:
             mtime = HOT_CONFIG_PATH.stat().st_mtime
             if mtime > _hot_config_cache["mtime"]:
                 with open(HOT_CONFIG_PATH) as f:
-                    _hot_config_cache["data"] = json.load(f)
+                    _hot_config_cache["data"] = _guard_objective_mix(json.load(f))
                 _hot_config_cache["mtime"] = mtime
         return _hot_config_cache["data"]
     except Exception as e:
@@ -2453,6 +2562,7 @@ def _dblock_hot_float(args, attr: str, default: float, names=None, min_value=Non
     except Exception:
         return cli_default
     value = _hot_float_from_config(cfg, keys, cli_default, min_value=min_value, max_value=max_value)
+    value = _ar_nat_sat_guard_float(cfg, attr, value)
     key = (id(args), attr)
     if _hot_dblock_float_seen.get(key) != value:
         _hot_dblock_float_seen[key] = value
@@ -2480,6 +2590,7 @@ def _dblock_loss_token_cap(args, objective: str) -> int:
         [attr, f"{obj}_loss_tokens", "dblock_loss_tokens", "loss_tokens"],
         default,
     )
+    value = _ar_nat_sat_guard_loss_tokens(cfg, obj, value)
     key = (id(args), attr)
     if _hot_dblock_loss_tokens_seen.get(key) != value:
         _hot_dblock_loss_tokens_seen[key] = value
@@ -3250,6 +3361,7 @@ _DATASET_COMPAT_RULES = [
     (re.compile(r"^allenai/dolma$"), {"loader": "dolma_url_manifest", "default_config": "v1_6-sample"}),
     (re.compile(r"^tiiuae/falcon-refinedweb$"), {"text_fields": ("content", "text")}),
     (re.compile(r"^HuggingFaceFW/fineweb-edu$"), {"default_config": "sample-10BT"}),
+    (re.compile(r"^code_search_net$"), {"text_fields": ("whole_func_string", "func_code_string", "func_documentation_string", "code")}),
     (re.compile(r"^Salesforce/wikitext$"), {"default_config": "wikitext-103-raw-v1"}),
 ]
 
@@ -3273,7 +3385,7 @@ def _dataset_text_fields_for_source(ds_name: str, preferred: str = "text") -> Li
 
     add(preferred)
     for field in compat.get("text_fields", ()): add(field)
-    for field in ("text", "content", "raw_content", "document", "body"):
+    for field in ("text", "content", "raw_content", "document", "body", "code", "whole_func_string", "func_code_string", "func_documentation_string"):
         add(field)
     return fields
 
@@ -6419,6 +6531,23 @@ def _build_val_set(source, chat_cfg, args, block):
         f"(hot_config={'on' if use_hot_config else 'off'}, seed {getattr(args, 'val_seed', 1337)})",
         flush=True,
     )
+    # AGILLM-FROZEN-VAL 20260704: cross-run-comparable validation. Streaming
+    # sources drift between restarts, so a per-restart rebuilt val set makes
+    # val CE incomparable across runs (bit us in the 2026-07-03/04 incident:
+    # promotion decisions leaned on CE deltas across restarts). Set
+    # AGILLM_VAL_FILE=/path.json to pin it: loads if present, otherwise the
+    # freshly built set is frozen there. Inert when the env is unset.
+    _val_file = os.environ.get("AGILLM_VAL_FILE", "").strip()
+    if _val_file and os.path.exists(_val_file):
+        try:
+            with open(_val_file) as _vf:
+                _frozen = json.load(_vf)
+            batches = [torch.tensor(_frozen[i:i + block + 1], dtype=torch.long).unsqueeze(0)
+                       for i in range(0, len(_frozen) - block, block + 1)]
+            print(f"[val] FROZEN held-out set loaded from {_val_file}: {len(batches)} batches x {block + 1} tokens", flush=True)
+            return batches
+        except Exception as e:
+            print(f"[val] failed to load frozen val file {_val_file} ({type(e).__name__}: {e}); rebuilding", flush=True)
     toks = []
     try:
         for t in token_stream(
@@ -6439,6 +6568,13 @@ def _build_val_set(source, chat_cfg, args, block):
     batches = [torch.tensor(toks[i:i + block + 1], dtype=torch.long).unsqueeze(0)
                for i in range(0, len(toks) - block, block + 1)]
     print(f"[val] held-out set ready: {len(batches)} batches x {block + 1} tokens (seed {getattr(args, 'val_seed', 1337)})", flush=True)
+    if _val_file and toks:
+        try:
+            with open(_val_file, "w") as _vf:
+                json.dump(toks, _vf)
+            print(f"[val] froze held-out set to {_val_file} ({len(toks)} tokens); future runs reuse it for comparable val CE", flush=True)
+        except Exception as e:
+            print(f"[val] failed to freeze val set to {_val_file}: {e}", flush=True)
     return batches
 
 
@@ -6622,14 +6758,34 @@ def _agillm43_quality_gate_latest_payload(path: Path, meta: dict, proposed: dict
         except Exception:
             existing = {}
     pinned = str(gate.get("pinned_delta") or gate.get("pinned_resume_delta") or "")
-    pinned_path = Path(pinned) if pinned else None
-    safe = existing if existing.get("path") else {}
-    if pinned_path is not None and pinned_path.exists():
-        safe = dict(safe)
-        safe["path"] = str(pinned_path)
+    promoted = str(gate.get("last_promoted_checkpoint") or gate.get("last_promoted_full_checkpoint") or "")
+    safe = {}
+    existing_path = Path(str(existing.get("path") or existing.get("checkpoint_path") or existing.get("raw_path") or ""))
+    try:
+        existing_step = int(existing.get("step") or 0)
+    except Exception:
+        existing_step = 0
+    promoted_path = Path(promoted) if promoted else None
+    if promoted_path is not None and promoted_path.exists() and existing_path != promoted_path:
+        safe = dict(existing)
+        safe["path"] = str(promoted_path)
+        safe["checkpoint_path"] = str(promoted_path)
+        safe["checkpoint_name"] = promoted_path.name
         safe["step"] = max_promoted
+    elif existing_path.exists() and existing_step > 0 and existing_step <= max_promoted:
+        safe = dict(existing)
+    else:
+        for value in (promoted, pinned):
+            candidate = Path(value) if value else None
+            if candidate is not None and candidate.exists():
+                safe = dict(existing)
+                safe["path"] = str(candidate)
+                safe["checkpoint_path"] = str(candidate)
+                safe["checkpoint_name"] = candidate.name
+                safe["step"] = max_promoted
+                break
     if not safe.get("path"):
-        return proposed, "quality gate wanted to pin latest.json, but no existing or pinned checkpoint was available"
+        return proposed, "quality gate wanted to pin latest.json, but no existing, promoted, or pinned checkpoint was available"
     safe.update({
         "candidate_under_review": str(path),
         "candidate_step": step,
@@ -9667,7 +9823,10 @@ def infer_server(args):
                     setattr(run_args, key, value)
             run_args.plain_output = True
             print("[INFER_SERVER_RESULT_START]", flush=True)
-            _agillm43_generate_from_instance(inst, run_args)
+            # The one-shot infer() path runs under @torch.no_grad(); the server
+            # port dropped it, so every warm request built autograd graphs.
+            with torch.inference_mode():
+                _agillm43_generate_from_instance(inst, run_args)
             print("[INFER_SERVER_RESULT_END]", flush=True)
         except Exception as exc:
             print(f"[INFER_SERVER_ERROR] {type(exc).__name__}: {exc}", flush=True)
