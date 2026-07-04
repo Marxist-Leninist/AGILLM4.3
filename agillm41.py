@@ -1254,18 +1254,27 @@ def _maybe_register_looped_infer(core, sd, args):
     print("[dblock-looped] inference: shared looped group, bands=%d" % bands, flush=True)
 
 
-def _sample_token_loss_inputs(hidden, targets, max_tokens):
+def _sample_token_loss_inputs(hidden, targets, max_tokens, loss_mask=None):
     max_tokens = int(max_tokens or 0)
-    if max_tokens <= 0:
-        return hidden.contiguous(), targets.contiguous(), int(targets.numel()), int(targets.numel())
     flat_targets = targets.reshape(-1)
     total = int(flat_targets.numel())
-    if total <= max_tokens:
-        return hidden.contiguous(), targets.contiguous(), total, total
-    # With-replacement sampling avoids building a full randperm each step; the sampled
-    # mean remains an unbiased estimator of the dense token CE mean.
-    idx = torch.randint(total, (max_tokens,), device=targets.device)
     flat_hidden = hidden.reshape(total, hidden.size(-1))
+    if loss_mask is not None:
+        mask = loss_mask.reshape(-1).to(device=targets.device, dtype=torch.bool)
+        if int(mask.numel()) != total:
+            raise ValueError(f"loss_mask size {int(mask.numel())} does not match targets {total}")
+        keep = torch.nonzero(mask, as_tuple=False).flatten()
+        if int(keep.numel()) > 0:
+            flat_hidden = flat_hidden.index_select(0, keep)
+            flat_targets = flat_targets.index_select(0, keep)
+            total = int(flat_targets.numel())
+    if total <= 0:
+        raise ValueError("no target tokens selected for loss")
+    if max_tokens <= 0 or total <= max_tokens:
+        return flat_hidden.contiguous(), flat_targets.contiguous(), total, total
+    # With-replacement sampling avoids building a full randperm each step; the sampled
+    # mean remains an unbiased estimator of the selected token CE mean.
+    idx = torch.randint(total, (max_tokens,), device=flat_targets.device)
     return flat_hidden.index_select(0, idx).contiguous(), flat_targets.index_select(0, idx).contiguous(), int(max_tokens), total
 
 
@@ -1295,7 +1304,7 @@ def _choose_objectives(state, args, ar_weight, sat_weight, nat_weight, do_sat_pe
     return picked == "ar", picked == "sat", picked == "nat", picked
 
 
-def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
+def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state, loss_mask=None):
     M = _agillm41_sys.modules[__name__]
 
     if state is not None and state.get("auto_search", False):
@@ -1369,8 +1378,9 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
             Dn = core.ln(cs * zt + co * h)
         _profile_toc(state, "ar_forward", _t)
         _t = _profile_tic(prof)
+        ar_loss_mask = loss_mask[:, 1:] if loss_mask is not None else None
         ar_hidden, ar_targets, ar_used, ar_total = _sample_token_loss_inputs(
-            Dn[:, :-1], ids[:, 1:], _dblock_loss_token_cap(args, "ar")
+            Dn[:, :-1], ids[:, 1:], _dblock_loss_token_cap(args, "ar"), ar_loss_mask
         )
         ar_raw = fused_ce(ar_hidden, ar_h.proj.weight, ar_targets)
         ar_raw_val = float(ar_raw.detach())
@@ -1405,8 +1415,11 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
         if sat_ctx.size(1) == 0 or sat_ctx.size(1) != sat_tgt.size(1):
             sat_ctx = Ds[:, :-1]
             sat_tgt = ids[:, 1:]
+        sat_loss_mask = None
+        if loss_mask is not None:
+            sat_loss_mask = loss_mask[:, SATB:] if sat_ctx.size(1) == loss_mask[:, SATB:].size(1) else loss_mask[:, 1:]
         sat_hidden, sat_targets, sat_used, sat_total = _sample_token_loss_inputs(
-            sat_ctx, sat_tgt, _dblock_loss_token_cap(args, "sat")
+            sat_ctx, sat_tgt, _dblock_loss_token_cap(args, "sat"), sat_loss_mask
         )
         sat_gate_ctx = sat_ctx[:, ::SATB]
         with M.amp(args.amp):
@@ -1442,6 +1455,11 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
         with M.amp(args.amp):
             nat_in = nat_ids.clone()
             m = M._nat_corruption_mask(nat_ids, ratio, args)
+            if loss_mask is not None:
+                lm_nat = loss_mask[:, :nat_ids.size(1)]
+                narrowed = m & lm_nat
+                if bool(narrowed.any()):
+                    m = narrowed
             if nat_mode in {"visible", "mask_plus_noise"}:
                 clean_hn = core.emb(nat_ids)
                 if nat_mode == "mask_plus_noise":
@@ -3514,6 +3532,46 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
         _source_state(src)
     source_text_fields = [_dataset_text_fields_for_source(src, dataset_field_text) for src in sources]
 
+    def _source_floor_fractions():
+        # The main train stream receives an already-expanded source list with
+        # use_hot_config=False, but source floors are still policy knobs.
+        cfg = get_hot_config()
+        raw_floor = cfg.get("dataset_min_fractions") or cfg.get("source_min_fractions") or {}
+        specs = []
+        if isinstance(raw_floor, dict):
+            specs = list(raw_floor.items())
+        elif isinstance(raw_floor, list):
+            for item in raw_floor:
+                if isinstance(item, dict):
+                    pat = item.get("match") or item.get("pattern") or item.get("source")
+                    val = item.get("min_fraction") or item.get("fraction") or item.get("weight")
+                    specs.append((pat, val))
+        floors = [0.0] * len(sources)
+        for pat, val in specs:
+            pat = str(pat or "").strip()
+            if not pat:
+                continue
+            try:
+                frac = max(0.0, min(0.80, float(val)))
+            except Exception:
+                continue
+            for i, src in enumerate(sources):
+                if pat in src:
+                    floors[i] = max(floors[i], frac)
+        total = sum(floors)
+        if total > 0.90:
+            scale = 0.90 / total
+            floors = [x * scale for x in floors]
+        return floors
+
+    source_floor_fractions = _source_floor_fractions()
+    if any(source_floor_fractions):
+        floor_msg = "; ".join(
+            f"{i}:{sources[i][:42]} min={source_floor_fractions[i]:.2f}"
+            for i in range(len(sources)) if source_floor_fractions[i] > 0
+        )
+        print(f"[dataset-router] source floors: {floor_msg}", flush=True)
+
     def _router_features(i, now):
         total_w = max(sum(weights), 1e-9)
         base = max(weights[i], 0.0) / total_w
@@ -3892,6 +3950,14 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
             eff.append(max(1e-9, weights[i] * (score ** router_sharpness)))
         if sum(eff) <= 0:
             eff = [weights[i] for i in available]
+        if any(source_floor_fractions[i] > 0 for i in available):
+            floor_sum = sum(source_floor_fractions[i] for i in available)
+            base_sum = sum(eff)
+            if base_sum > 0 and floor_sum < 1.0:
+                remainder = max(0.0, 1.0 - floor_sum)
+                eff = [source_floor_fractions[i] + remainder * (eff[pos] / base_sum) for pos, i in enumerate(available)]
+            else:
+                eff = [max(source_floor_fractions[i], 1e-9) for i in available]
         return _rng.choices(available, weights=eff)[0]
 
     agent_provider, agent_key, agent_model, agent_status = _agent_provider_key_model()
@@ -3996,6 +4062,92 @@ def token_stream(ds_names: str, target: int, seed: int = 42,
                     flush=True,
                 )
                 last_retry_log[src_idx] = time.time()
+
+
+def _agillm_field_from_candidates(ex, names):
+    if not isinstance(ex, dict):
+        return ""
+    for raw in str(names or "").split(","):
+        name = raw.strip()
+        if name and isinstance(ex.get(name), str) and ex.get(name).strip():
+            return ex.get(name)
+    return ""
+
+
+def completion_only_sequence_stream(ds_names: str, block: int, seed: int, args, streaming: bool = True):
+    """Yield fixed-length (ids, loss_mask) pairs for prompt/completion SFT.
+
+    The input tokens include prompt + completion, but the loss mask is true only
+    for completion/EOS target tokens. This avoids the anchor-poisoning failure
+    mode where the model learns to emit prompt scaffolding such as "Prompt" or
+    repeated answer words.
+    """
+    raw = [x.strip() for x in str(ds_names or "").split(",") if x.strip()]
+    if not raw:
+        return
+    sources, weights = [], []
+    for src in raw:
+        w = 1.0
+        head, sep, tail = src.rpartition("|")
+        if sep:
+            try:
+                w = float(tail)
+                src = head
+            except Exception:
+                pass
+        sources.append(src)
+        weights.append(max(0.0, w))
+    if sum(weights) <= 0:
+        weights = [1.0] * len(sources)
+    rng = random.Random(seed)
+    its = [None] * len(sources)
+    prompt_fields = getattr(args, "sft_prompt_field", "prompt") or "prompt"
+    completion_fields = getattr(args, "sft_completion_field", "completion") or "completion"
+    separator = getattr(args, "sft_separator", "") or ""
+    pad_id = int(EOS if EOS is not None else 0)
+    emitted = 0
+    while True:
+        src_idx = rng.choices(range(len(sources)), weights=weights)[0]
+        try:
+            if its[src_idx] is None:
+                its[src_idx] = _open_stream_one(sources[src_idx], seed + src_idx, streaming=streaming)
+            ex = next(its[src_idx])
+        except StopIteration:
+            its[src_idx] = None
+            continue
+        except Exception as exc:
+            its[src_idx] = None
+            print(f"[sft-completion] source error {sources[src_idx]}: {type(exc).__name__}", flush=True)
+            time.sleep(1.0)
+            continue
+        prompt = _agillm_field_from_candidates(ex, prompt_fields)
+        completion = _agillm_field_from_candidates(ex, completion_fields)
+        if not prompt or not completion:
+            continue
+        prompt_text = str(prompt) + str(separator)
+        completion_text = str(completion)
+        prompt_ids = tok.encode(prompt_text)
+        full_ids = tok.encode(prompt_text + completion_text)
+        if EOS is not None and (not full_ids or full_ids[-1] != EOS):
+            full_ids = full_ids + [int(EOS)]
+        if not prompt_ids or len(full_ids) <= len(prompt_ids):
+            continue
+        if len(full_ids) > block:
+            # Quality rescue rows should be short; skip oversized rows rather than
+            # truncating away the answer boundary and corrupting the mask.
+            continue
+        loss_mask = [False] * len(full_ids)
+        for i in range(len(prompt_ids), len(full_ids)):
+            loss_mask[i] = True
+        if not any(loss_mask[1:]):
+            continue
+        pad = int(block) - len(full_ids)
+        yield full_ids + [pad_id] * pad, loss_mask + [False] * pad
+        emitted += 1
+        if emitted <= 3 or emitted % 100 == 0:
+            kept = sum(1 for x in loss_mask if x)
+            print(f"[sft-completion] emitted={emitted} src={sources[src_idx]} prompt_tokens={len(prompt_ids)} completion_targets={kept}", flush=True)
+
 
 # ───────────────────────── ALiBi ─────────────────────────
 def _alibi_slopes(n_heads: int):
@@ -6246,6 +6398,9 @@ def _build_val_set(source, chat_cfg, args, block):
     n = int(getattr(args, "val_tokens", 0) or 0)
     if n <= 0:
         return []
+    if bool(getattr(args, "sft_completion_only", False)):
+        print("[val] completion-only SFT: validation disabled (prompt/completion rows use masked targets)", flush=True)
+        return []
     want = max(1, n // (block + 1)) * (block + 1)
     val_source_requested = str(getattr(args, "val_source", "") or "").strip()
     val_source = val_source_requested
@@ -6435,6 +6590,54 @@ def _flush_delta():
         print("  [delta] flushing in-flight write...")
         _delta_thread.join(timeout=120)
 
+def _agillm43_quality_gate_latest_payload(path: Path, meta: dict, proposed: dict):
+    """Keep latest.json pinned when a quality gate requires review of newer checkpoints."""
+    gate_path = Path(os.environ.get("AGILLM43_QUALITY_GATE", "/workspace/agillm43_quality_gate.json"))
+    if not gate_path.exists():
+        return proposed, None
+    try:
+        gate = json.loads(gate_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return proposed, f"could not read quality gate {gate_path}: {exc}; latest.json updated normally"
+    if not isinstance(gate, dict) or not gate.get("require_auto_infer_ok", False):
+        return proposed, None
+    try:
+        step = int(meta.get("step") or proposed.get("step") or 0)
+    except Exception:
+        step = 0
+    try:
+        max_promoted = int(gate.get("max_promoted_delta_step") or 0)
+    except Exception:
+        max_promoted = 0
+    if max_promoted <= 0 or step <= max_promoted:
+        return proposed, None
+
+    latest_file = path.parent / "latest.json"
+    existing = {}
+    if latest_file.exists():
+        try:
+            loaded = json.loads(latest_file.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                existing = loaded
+        except Exception:
+            existing = {}
+    pinned = str(gate.get("pinned_delta") or gate.get("pinned_resume_delta") or "")
+    pinned_path = Path(pinned) if pinned else None
+    safe = existing if existing.get("path") else {}
+    if pinned_path is not None and pinned_path.exists():
+        safe = dict(safe)
+        safe["path"] = str(pinned_path)
+        safe["step"] = max_promoted
+    if not safe.get("path"):
+        return proposed, "quality gate wanted to pin latest.json, but no existing or pinned checkpoint was available"
+    safe.update({
+        "candidate_under_review": str(path),
+        "candidate_step": step,
+        "candidate_block_reason": f"step {step} is above quality gate max_promoted_delta_step={max_promoted}",
+        "updated_by": "agillm43_quality_gate_save_guard",
+    })
+    return safe, safe["candidate_block_reason"]
+
 def save_ckpt(path: pathlib.Path, core, ar_h, sat_h, nat_h, opt, scaler, meta, codec: str = "zstd", provenance=None):
     path.parent.mkdir(exist_ok=True, parents=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -6503,7 +6706,11 @@ def save_ckpt(path: pathlib.Path, core, ar_h, sat_h, nat_h, opt, scaler, meta, c
     if meta.get("dataset_provenance"):
         latest_payload["dataset_provenance"] = meta.get("dataset_provenance")
         latest_payload["source_effective"] = meta.get("dataset_provenance", {}).get("source_effective", "")
-    (path.parent / "latest.json").write_text(json.dumps(latest_payload))
+    latest_file = path.parent / "latest.json"
+    latest_payload, latest_gate_reason = _agillm43_quality_gate_latest_payload(path, meta, latest_payload)
+    latest_file.write_text(json.dumps(latest_payload))
+    if latest_gate_reason:
+        print(f"[quality-gate] kept latest.json pinned; candidate under review: {latest_gate_reason}", flush=True)
     if info.get("codec") == "zstd":
         print(f"\n✓ saved checkpoint {path.name} codec=zstd ratio={info.get('ratio', 0.0):.2f}x")
     elif info.get("codec") == "block-sharded":
@@ -7520,15 +7727,26 @@ def _train_phase(
     )
     val_batches = _build_val_set(effective_source, chat_cfg, args, BLOCK)
     last_val_mono = time.monotonic()
-    stream = token_stream(
-        effective_source, total_tokens_needed, seed=data_seed,
-        chat=chat_cfg.get("chat", False),
-        chat_messages_key=chat_cfg.get("key", "messages"),
-        sft_add_generation_prompt=chat_cfg.get("gen_prompt", False),
-        dataset_field_text=chat_cfg.get("text_field", "text"),
-        streaming=streaming,
-        use_hot_config=False,
-    )
+    completion_only = bool(getattr(args, "sft_completion_only", False))
+    if completion_only:
+        stream = None
+        sft_stream = completion_only_sequence_stream(effective_source, BLOCK, data_seed, args, streaming=streaming)
+        print(
+            f"[{phase_name}] completion-only SFT enabled: prompt_field={getattr(args, 'sft_prompt_field', 'prompt')} "
+            f"completion_field={getattr(args, 'sft_completion_field', 'completion')}",
+            flush=True,
+        )
+    else:
+        sft_stream = None
+        stream = token_stream(
+            effective_source, total_tokens_needed, seed=data_seed,
+            chat=chat_cfg.get("chat", False),
+            chat_messages_key=chat_cfg.get("key", "messages"),
+            sft_add_generation_prompt=chat_cfg.get("gen_prompt", False),
+            dataset_field_text=chat_cfg.get("text_field", "text"),
+            streaming=streaming,
+            use_hot_config=False,
+        )
     ce_tok = nn.CrossEntropyLoss(label_smoothing=0.1)
     ce_gate = nn.CrossEntropyLoss()
     ctc = nn.CTCLoss(blank=BLANK, zero_infinity=True)
@@ -7538,6 +7756,7 @@ def _train_phase(
     grow_plan = _parse_grow_plan(args.grow_plan) if args.auto_grow else []
     buf: list[int] = []
     batch_accum: list[list[int]] = []
+    mask_accum: list[list[bool]] = []
     step = start_step
     steps_since_last_grow = 0
     oom_retries = 0
@@ -7549,7 +7768,7 @@ def _train_phase(
     last_heartbeat_mono = time.monotonic()
     _disk_hygiene(pathlib.Path(args.save_dir), phase_name, args, reason="startup")
     # Derive origin tag from warmstart path for checkpoint naming
-    _ws_path = getattr(args, "warmstart_from", None) or getattr(args, "resume", None) or ""
+    _ws_path = getattr(args, "warmstart_from", None) or getattr(args, "resume", None) or getattr(args, "resume_delta", None) or ""
     _ws_m = re.search(r"step(\d+)", pathlib.Path(_ws_path).name) if _ws_path else None
     _origin_tag = f"_from{int(_ws_m.group(1)):08d}" if _ws_m else ""
     _role_tag = f"_{getattr(args, 'ckpt_role', '').strip()}" if getattr(args, "ckpt_role", "").strip() else ""
@@ -7605,24 +7824,36 @@ def _train_phase(
     while seen_tok < total_tokens_needed:
         _profile_batch = _DBS is not None and int(getattr(args, "profile_steps", 0) or 0) > 0 and int(_DBS.get("profile_n", 0)) < int(getattr(args, "profile_steps", 0) or 0)
         _data_t = time.perf_counter() if _profile_batch else None
-        try:
-            while len(buf) < BLOCK:
-                buf.append(next(stream))
-        except StopIteration:
-            break
-        if _profile_batch:
+        loss_mask = None
+        if completion_only:
             try:
-                _db_prof = _agillm41_sys.modules[__name__]
-                _db_prof._profile_add(_DBS, "data_stream", time.perf_counter() - _data_t)
-            except Exception:
-                pass
-        seq = buf[:BLOCK]
-        buf = buf[BLOCK:]
-        batch_accum.append(seq)
+                while len(batch_accum) < BATCH:
+                    seq, mseq = next(sft_stream)
+                    batch_accum.append(seq)
+                    mask_accum.append(mseq)
+            except StopIteration:
+                break
+        else:
+            try:
+                while len(buf) < BLOCK:
+                    buf.append(next(stream))
+            except StopIteration:
+                break
+            if _profile_batch:
+                try:
+                    _db_prof = _agillm41_sys.modules[__name__]
+                    _db_prof._profile_add(_DBS, "data_stream", time.perf_counter() - _data_t)
+                except Exception:
+                    pass
+            seq = buf[:BLOCK]
+            buf = buf[BLOCK:]
+            batch_accum.append(seq)
         if len(batch_accum) < BATCH:
             continue
         _tensor_t = time.perf_counter() if _profile_batch else None
         ids = torch.tensor(batch_accum, device=DEV)
+        if completion_only:
+            loss_mask = torch.tensor(mask_accum, dtype=torch.bool, device=DEV)
         if _profile_batch:
             if DEV.type == "cuda":
                 try:
@@ -7635,16 +7866,24 @@ def _train_phase(
             except Exception:
                 pass
         batch_accum = []
+        if completion_only:
+            mask_accum = []
         tgt_ar = ids.clone()
         try:
             if getattr(args, "dblock", False):
-                loss_value = _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, _DBS)
+                loss_value = _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, _DBS, loss_mask=loss_mask)
                 _prov_loss = float(loss_value)
             else:
                 with amp(args.amp):
                     h_ar = core(ids, causal_mask(ids.size(1), structured=use_structured_masks(args)))
                     logits_ar = ar_h(h_ar)[:, :-1]
-                    loss_ar = ce_tok(logits_ar.reshape(-1, VOCAB), tgt_ar[:, 1:].reshape(-1))
+                    if loss_mask is not None:
+                        _lm = loss_mask[:, 1:].reshape(-1)
+                        _logits_flat = logits_ar.reshape(-1, VOCAB)
+                        _targets_flat = tgt_ar[:, 1:].reshape(-1)
+                        loss_ar = ce_tok(_logits_flat[_lm], _targets_flat[_lm])
+                    else:
+                        loss_ar = ce_tok(logits_ar.reshape(-1, VOCAB), tgt_ar[:, 1:].reshape(-1))
                 loss_value = float(loss_ar.detach().item())
                 _aux = _collect_moe_aux(core, getattr(args,'moe_aux_coef',0.0), getattr(args,'moe_z_coef',0.0))
                 if torch.is_tensor(_aux):
@@ -7663,7 +7902,11 @@ def _train_phase(
                             sat_ctx = h_sat[:, :-1]
                             tgt_sat = ids[:, 1:]
                         logits_sat = sat_h.proj(sat_ctx)
-                        loss_sat = ce_tok(logits_sat.reshape(-1, VOCAB), tgt_sat.reshape(-1))
+                        if loss_mask is not None:
+                            _sat_lm = loss_mask[:, SAT_BLOCK:] if sat_ctx.size(1) == loss_mask[:, SAT_BLOCK:].size(1) else loss_mask[:, 1:]
+                            loss_sat = ce_tok(logits_sat.reshape(-1, VOCAB)[_sat_lm.reshape(-1)], tgt_sat.reshape(-1)[_sat_lm.reshape(-1)])
+                        else:
+                            loss_sat = ce_tok(logits_sat.reshape(-1, VOCAB), tgt_sat.reshape(-1))
                         if sat_h.gate is not None:
                             sat_gate_ctx = sat_ctx[:, ::SAT_BLOCK]
                             gate_targets = torch.ones(
@@ -7695,6 +7938,11 @@ def _train_phase(
                         nat_in = nat_ids.clone()
                         ratio = min(max(float(args.nat_mask_ratio), 0.05), 0.95)
                         mask = _nat_corruption_mask(nat_ids, ratio, args)
+                        if loss_mask is not None:
+                            _nat_lm = loss_mask[:, :nat_ids.size(1)]
+                            _narrowed = mask & _nat_lm
+                            if bool(_narrowed.any()):
+                                mask = _narrowed
                         nat_in[mask] = BLANK
                         h_nat = core(nat_in, None)
                         logits_nat = nat_h(h_nat)
@@ -7717,7 +7965,7 @@ def _train_phase(
             if "out of memory" in msg or "cuda error" in msg:
                 batch_accum = []
                 try:
-                    del ids, tgt_ar
+                    del ids, tgt_ar, loss_mask
                 except Exception:
                     pass
                 opt.zero_grad(set_to_none=True)
@@ -7903,7 +8151,7 @@ def _train_phase(
             _prov = _agillm_provenance.collect(args,
                 step=step, seen_tok=seen_tok, loss=_prov_loss,
                 batch_size=BATCH_REQUESTED, block_size=BLOCK,
-                warmstart_source_path=getattr(args, 'warmstart_from', None) or getattr(args, 'resume', None),
+                warmstart_source_path=getattr(args, 'warmstart_from', None) or getattr(args, 'resume', None) or getattr(args, 'resume_delta', None),
                 warmstart_source_provenance=provenance_cache,
                 dataset_provenance=dataset_meta, lane=phase_name or "",
                 _sample_core=core, _sample_ar=ar_h, _sample_sat=sat_h,
@@ -7935,7 +8183,7 @@ def _train_phase(
                 _prov = _agillm_provenance.collect(args,
                     step=step, seen_tok=seen_tok, loss=_prov_loss,
                     batch_size=BATCH_REQUESTED, block_size=BLOCK,
-                    warmstart_source_path=getattr(args, 'warmstart_from', None) or getattr(args, 'resume', None),
+                    warmstart_source_path=getattr(args, 'warmstart_from', None) or getattr(args, 'resume', None) or getattr(args, 'resume_delta', None),
                     warmstart_source_provenance=provenance_cache,
                     dataset_provenance=dataset_meta, lane=phase_name or "",
                 _sample_core=core, _sample_ar=ar_h, _sample_sat=sat_h,
@@ -7971,7 +8219,7 @@ def _train_phase(
             _delta_prov = _agillm_provenance.collect(args,
                 step=step, seen_tok=seen_tok, loss=_prov_loss,
                 batch_size=BATCH_REQUESTED, block_size=BLOCK,
-                warmstart_source_path=getattr(args, 'warmstart_from', None) or getattr(args, 'resume', None),
+                warmstart_source_path=getattr(args, 'warmstart_from', None) or getattr(args, 'resume', None) or getattr(args, 'resume_delta', None),
                 warmstart_source_provenance=provenance_cache,
                 dataset_provenance=dataset_meta, lane=phase_name or "",
                 checkpoint_type="delta")
@@ -7997,7 +8245,7 @@ def _train_phase(
         _prov = _agillm_provenance.collect(args,
             step=step, seen_tok=seen_tok, loss=_prov_loss,
             batch_size=BATCH_REQUESTED, block_size=BLOCK,
-            warmstart_source_path=getattr(args, 'warmstart_from', None) or getattr(args, 'resume', None),
+            warmstart_source_path=getattr(args, 'warmstart_from', None) or getattr(args, 'resume', None) or getattr(args, 'resume_delta', None),
             warmstart_source_provenance=provenance_cache,
             dataset_provenance=dataset_meta, lane=phase_name or "",
                 _sample_core=core, _sample_ar=ar_h, _sample_sat=sat_h,
@@ -8029,6 +8277,8 @@ def train(args):
             src_probe = pathlib.Path(args.warmstart_from)
         elif args.resume:
             src_probe = pathlib.Path(args.resume)
+        elif args.resume_delta:
+            src_probe = pathlib.Path(args.resume_delta)
         else:
             src_probe = pathlib.Path(args.save_dir) / "final.pt"
         prev_cfg = infer_cfg_from_ckpt(src_probe)
@@ -8232,7 +8482,7 @@ def train(args):
         step=step, seen_tok=seen_tok, loss=0.0,
         batch_size=int(args.batch_size or DEFAULT_BATCH),
         block_size=int(args.block or DEFAULT_BLOCK),
-        warmstart_source_path=getattr(args, 'warmstart_from', None) or getattr(args, 'resume', None),
+        warmstart_source_path=getattr(args, 'warmstart_from', None) or getattr(args, 'resume', None) or getattr(args, 'resume_delta', None),
         warmstart_source_provenance=_agillm_provenance_cache,
         dataset_provenance=final_dataset_meta, lane="final",
         _sample_core=core, _sample_ar=ar_h, _sample_sat=sat_h,
@@ -8959,15 +9209,31 @@ def _agillm43_generate_from_instance(inst, args):
     min_new = int(getattr(args, "min_new", 0) or 0)
     if args.mode == "sat":
         min_new = max(min_new, SAT_BLOCK)
+    # AGILLM-STREAM 20260703 / AGILLM-AR-DRAFT-PORT 20260704: machine-readable per-commit markers (plain only).
+    stream = bool(getattr(args, "stream", False)) and plain_output
     prompt_tokens = tok.encode(args.prompt)
     prompt_len = len(prompt_tokens)
     ids = torch.tensor([prompt_tokens], device=DEV)
     if ids.size(1) == 0: 
         ids = torch.tensor([[EOS]], device=DEV)
         prompt_len = 1
+    ar_draft_mode = str(getattr(args, "ar_draft", "off") or "off").strip().lower().replace("-", "_").replace(" ", "_")
+    ar_draft_mode = {
+        "sat": "sat_var",
+        "satvar": "sat_var",
+        "satvariable": "sat_var",
+        "sat_fixed": "sat_fixed",
+        "satfixed": "sat_fixed",
+        "nat": "nat",
+        "none": "off",
+        "false": "off",
+        "0": "off",
+    }.get(ar_draft_mode, ar_draft_mode)
     mode_str = args.mode
     if args.mode == "sat":
         mode_str = f"sat-{'var' if args.var else 'fixed'}"
+    elif args.mode == "ar" and ar_draft_mode != "off":
+        mode_str = f"ar+draft-{ar_draft_mode.replace('_', '-')}"
     if plain_output:
         print(f"Generating ({mode_str})...")
     else:
@@ -8984,6 +9250,8 @@ def _agillm43_generate_from_instance(inst, args):
         ids = _swireasoning_decode(core, ar_h, ids, args, min_new)
     elif args.mode == "ar":
         _euler = getattr(args, "sampler", "ar") == "euler"
+        if stream:
+            print("[STREAM_BEGIN] " + json.dumps({"mode": "ar", "slots": int(args.max_new)}), flush=True)
         block_stream_kv = block_stream and _block_stream_kv_cache_enabled(args)
         kvs = None
         if not _euler and block_stream_kv:
@@ -8997,23 +9265,172 @@ def _agillm43_generate_from_instance(inst, args):
             )
         elif not _euler and not block_stream:
             h, kvs = core(ids, causal_mask(ids.size(1), structured=use_structured_masks(args)), use_cache=True, total_seq_len=ids.size(1))
-        for _ in range(args.max_new):
-            if _euler:
-                h = _dblock_euler_hidden(core, ids, args)
-            elif block_stream and not block_stream_kv:
-                h = _block_stream_forward(core, ids, causal_mask(ids.size(1), structured=use_structured_masks(args)), args)
-            logits = ar_h(h)[:, -1].float()
-            logits = _apply_penalties(logits, ids, args.penalty_last_n, args.repetition_penalty, args.presence_penalty, args.frequency_penalty)
+        draft_stats = None
+
+        def _ar_next_from_hidden(hidden, prefix_ids):
+            logits = ar_h(hidden)[:, -1].float()
+            logits = _apply_penalties(
+                logits,
+                prefix_ids,
+                args.penalty_last_n,
+                args.repetition_penalty,
+                args.presence_penalty,
+                args.frequency_penalty,
+            )
             logits = _suppress_eos(logits, args)
-            nxt = _sample(logits, args.temperature, args.top_k, args.top_p, args.min_p, args.greedy)
-            ids = torch.cat([ids, nxt], 1)
-            if EOS is not None and not getattr(args, "ignore_eos", False) and int(nxt.item()) == int(EOS):
-                break
-            if not _euler:
-                if block_stream_kv:
-                    h, kvs = _block_stream_forward_cached(core, ids[:, -1:], None, kvs, ids.size(1), args)
-                elif not block_stream:
-                    h, kvs = core(ids[:, -1:], None, kv_caches=kvs, use_cache=True, total_seq_len=ids.size(1))
+            return _sample(logits, args.temperature, args.top_k, args.top_p, args.min_p, args.greedy)
+
+        if ar_draft_mode != "off":
+            disabled = []
+            if _euler:
+                disabled.append("euler sampler")
+            if block_stream:
+                disabled.append("block_stream")
+            if not bool(getattr(args, "greedy", False)):
+                disabled.append("non-greedy sampling")
+            if not bool(getattr(args, "ignore_eos", False)):
+                disabled.append("eos-stop mode")
+            if ar_draft_mode in {"sat_var", "sat_fixed"} and sat_h is None:
+                disabled.append("missing SAT head")
+            if ar_draft_mode == "nat" and nat_h is None:
+                disabled.append("missing NAT head")
+            if ar_draft_mode not in {"sat_var", "sat_fixed", "nat"}:
+                disabled.append(f"unknown draft mode {ar_draft_mode}")
+            if disabled:
+                print(f"[infer] ar_draft={ar_draft_mode} disabled ({'; '.join(disabled)}); using plain ar")
+            else:
+                draft_stats = {"mode": ar_draft_mode, "attempted": 0, "accepted": 0, "rejected": 0}
+
+        def _draft_from_sat(prefix_ids, hidden, remaining):
+            stride_cap = min(max(1, int(getattr(args, "ar_draft_max", 2) or 2)), SAT_BLOCK, int(remaining))
+            if stride_cap <= 0:
+                return None
+            logits_all, gate = sat_h(hidden[:, -SAT_BLOCK:])
+            logits_all = logits_all.float()
+            stride = SAT_BLOCK
+            if ar_draft_mode == "sat_var" and gate is not None:
+                stride = int(gate.float().softmax(-1).argmax(-1).item()) + 1
+            stride = max(1, min(int(stride), int(logits_all.size(1)), stride_cap))
+            pieces = []
+            penalty_prefix = prefix_ids
+            for i in range(stride):
+                logits = logits_all[:, i].clone()
+                logits[..., BLANK] = -1e9
+                logits = _apply_penalties(
+                    logits,
+                    penalty_prefix,
+                    args.penalty_last_n,
+                    args.repetition_penalty,
+                    args.presence_penalty,
+                    args.frequency_penalty,
+                )
+                logits = _suppress_eos(logits, args)
+                nxt = _sample(logits, args.temperature, args.top_k, args.top_p, args.min_p, args.greedy)
+                pieces.append(nxt)
+                penalty_prefix = torch.cat([penalty_prefix, nxt], 1)
+            return torch.cat(pieces, dim=1) if pieces else None
+
+        def _draft_from_nat(prefix_ids, remaining):
+            stride = min(max(1, int(getattr(args, "ar_draft_max", 4) or 4)), int(remaining))
+            if stride <= 0:
+                return None
+            blanks = torch.full((prefix_ids.size(0), stride), int(BLANK), device=prefix_ids.device, dtype=prefix_ids.dtype)
+            work_ids = torch.cat([prefix_ids, blanks], 1)
+            h_nat = core(work_ids, None)
+            logits_all = nat_h(h_nat).float()
+            pieces = []
+            penalty_prefix = prefix_ids
+            base = int(prefix_ids.size(1))
+            for i in range(stride):
+                logits = logits_all[:, base + i].clone()
+                logits[..., BLANK] = -1e9
+                logits = _apply_penalties(
+                    logits,
+                    penalty_prefix,
+                    args.penalty_last_n,
+                    args.repetition_penalty,
+                    args.presence_penalty,
+                    args.frequency_penalty,
+                )
+                logits = _suppress_eos(logits, args)
+                nxt = _sample(logits, args.temperature, args.top_k, args.top_p, args.min_p, args.greedy)
+                pieces.append(nxt)
+                penalty_prefix = torch.cat([penalty_prefix, nxt], 1)
+            return torch.cat(pieces, dim=1) if pieces else None
+
+        def _draft_proposal(prefix_ids, hidden, remaining):
+            if ar_draft_mode in {"sat_var", "sat_fixed"}:
+                return _draft_from_sat(prefix_ids, hidden, remaining)
+            if ar_draft_mode == "nat":
+                return _draft_from_nat(prefix_ids, remaining)
+            return None
+
+        def _proposal_verified(prefix_ids, hidden, cached_kvs, proposal):
+            verify_h, verify_kvs = core(
+                proposal,
+                None,
+                kv_caches=cached_kvs,
+                use_cache=True,
+                total_seq_len=prefix_ids.size(1) + proposal.size(1),
+            )
+            penalty_prefix = prefix_ids
+            for i in range(int(proposal.size(1))):
+                step_h = hidden if i == 0 else verify_h[:, i - 1:i]
+                expected = _ar_next_from_hidden(step_h, penalty_prefix)
+                if int(expected.item()) != int(proposal[0, i].item()):
+                    return False, None, None
+                penalty_prefix = torch.cat([penalty_prefix, proposal[:, i:i + 1]], 1)
+            return True, verify_h, verify_kvs
+
+        if draft_stats is not None:
+            added = 0
+            while added < args.max_new:
+                remaining = int(args.max_new) - int(added)
+                proposal = _draft_proposal(ids, h, remaining)
+                if proposal is not None and proposal.size(1) > 0:
+                    draft_stats["attempted"] += int(proposal.size(1))
+                    ok, verify_h, verify_kvs = _proposal_verified(ids, h, kvs, proposal)
+                    if ok:
+                        first_i = int(ids.size(1) - prompt_len)
+                        ids = torch.cat([ids, proposal], 1)
+                        h, kvs = verify_h, verify_kvs
+                        added += int(proposal.size(1))
+                        draft_stats["accepted"] += int(proposal.size(1))
+                        if stream:
+                            for off, token_id in enumerate(proposal[0].tolist()):
+                                print("[STREAM_AR] " + json.dumps({
+                                    "i": first_i + off,
+                                    "text": tok.decode([int(token_id)], skip_special_tokens=True),
+                                }), flush=True)
+                        continue
+                    draft_stats["rejected"] += int(proposal.size(1))
+                nxt = _ar_next_from_hidden(h, ids)
+                ids = torch.cat([ids, nxt], 1)
+                added += 1
+                if stream:
+                    print("[STREAM_AR] " + json.dumps({"i": int(ids.size(1) - prompt_len) - 1,
+                                                       "text": tok.decode([int(nxt.item())], skip_special_tokens=True)}), flush=True)
+                if EOS is not None and not getattr(args, "ignore_eos", False) and int(nxt.item()) == int(EOS):
+                    break
+                h, kvs = core(ids[:, -1:], None, kv_caches=kvs, use_cache=True, total_seq_len=ids.size(1))
+        else:
+            for _ in range(args.max_new):
+                if _euler:
+                    h = _dblock_euler_hidden(core, ids, args)
+                elif block_stream and not block_stream_kv:
+                    h = _block_stream_forward(core, ids, causal_mask(ids.size(1), structured=use_structured_masks(args)), args)
+                nxt = _ar_next_from_hidden(h, ids)
+                ids = torch.cat([ids, nxt], 1)
+                if stream:
+                    print("[STREAM_AR] " + json.dumps({"i": int(ids.size(1) - prompt_len) - 1,
+                                                       "text": tok.decode([int(nxt.item())], skip_special_tokens=True)}), flush=True)
+                if EOS is not None and not getattr(args, "ignore_eos", False) and int(nxt.item()) == int(EOS):
+                    break
+                if not _euler:
+                    if block_stream_kv:
+                        h, kvs = _block_stream_forward_cached(core, ids[:, -1:], None, kvs, ids.size(1), args)
+                    elif not block_stream:
+                        h, kvs = core(ids[:, -1:], None, kv_caches=kvs, use_cache=True, total_seq_len=ids.size(1))
     elif args.mode == "nat":
         # Iterative mask-predict decode (CMLM): keep the prompt fixed and fill the
         # BLANK slots, committing confident predictions each pass. Unlike the
@@ -9120,7 +9537,18 @@ def _agillm43_generate_from_instance(inst, args):
             logits_all = logits_all.float()
             if gate is not None:
                 gate = gate.float()
-            stride = SAT_BLOCK if (not args.var or gate is None) else (gate.softmax(-1).multinomial(1).item() + 1)
+            if not args.var or gate is None:
+                stride = SAT_BLOCK
+            else:
+                gate_probs = gate.softmax(-1)
+                if bool(getattr(args, "greedy", False)):
+                    stride = int(gate_probs.argmax(-1).item()) + 1
+                    # Keep SAT-var from degenerating to AR-speed one-token strides
+                    # on deterministic inference. Block-size 2 is the minimum useful
+                    # speed win while still allowing the learned gate to choose larger.
+                    stride = max(stride, min(2, SAT_BLOCK))
+                else:
+                    stride = int(gate_probs.multinomial(1).item()) + 1
             stride = min(int(stride), logits_all.size(1))
             new_tokens = []
             for i in range(int(stride)):
@@ -9159,6 +9587,15 @@ def _agillm43_generate_from_instance(inst, args):
     elapsed = time.time() - start
     gen_tokens = len(ids[0]) - prompt_len
     tok_per_sec = gen_tokens / elapsed if elapsed > 0 else 0
+    if args.mode == "ar" and 'draft_stats' in locals() and draft_stats is not None:
+        attempted = int(draft_stats.get("attempted") or 0)
+        accepted = int(draft_stats.get("accepted") or 0)
+        rejected = int(draft_stats.get("rejected") or 0)
+        accept_rate = (100.0 * accepted / attempted) if attempted else 0.0
+        print(
+            f"[infer] ar_draft={draft_stats.get('mode')} attempted={attempted} "
+            f"accepted={accepted} rejected={rejected} accept_rate={accept_rate:.1f}%"
+        )
     if (block_stream or resident_dtype) and torch.cuda.is_available():
         peak_alloc_gb = torch.cuda.max_memory_allocated() / 1e9
         peak_reserved_gb = torch.cuda.max_memory_reserved() / 1e9
@@ -9206,7 +9643,7 @@ def infer_server(args):
     inst = _agillm43_prepare_infer_instance(args)
     print("[INFER_SERVER_READY]", flush=True)
     request_fields = {
-        "prompt", "mode", "max_new", "min_new", "temperature", "top_k", "top_p",
+        "prompt", "mode", "stream", "ar_draft", "ar_draft_max", "max_new", "min_new", "temperature", "top_k", "top_p",
         "min_p", "greedy", "ignore_eos", "nat_passes", "nat_greedy", "nat_conf_threshold",
         "var", "repetition_penalty", "presence_penalty", "frequency_penalty", "penalty_last_n",
         "claude_friendly", "sampler", "euler_steps", "euler_start_sigma", "dblock_blocks",
@@ -10025,6 +10462,14 @@ def main():
     tr.add_argument("--chat_messages_key", default="messages")
     tr.add_argument("--dataset_field_text", default="text")
     tr.add_argument("--sft_add_generation_prompt", action="store_true")
+    tr.add_argument("--sft_completion_only", action="store_true",
+                    help="For JSON SFT rows, train CE only on completion target tokens while keeping prompt tokens as context.")
+    tr.add_argument("--sft_prompt_field", default="prompt",
+                    help="Comma-separated JSON field names to read as prompt context for --sft_completion_only.")
+    tr.add_argument("--sft_completion_field", default="completion,answer,response,output",
+                    help="Comma-separated JSON field names to read as completion targets for --sft_completion_only.")
+    tr.add_argument("--sft_separator", default="",
+                    help="Optional text inserted between prompt and completion for --sft_completion_only.")
     tr.add_argument("--auto_grow", action="store_true")
     tr.add_argument("--grow_plan", default="576,640,768,896,1024,1122")
     tr.add_argument("--grow_every_steps", type=int, default=50000)
@@ -10042,6 +10487,10 @@ def main():
     tr.add_argument("--after_sft_lr_head", type=float, default=0.0)
     inf = sub.add_parser("infer")
     inf.add_argument("--mode", choices=["ar", "sat", "nat"], required=True)
+    inf.add_argument("--ar_draft", choices=["off", "sat_fixed", "sat_var", "nat"], default="off",
+                     help="AR verifier with a cheap SAT/NAT draft proposal. Greedy + ignore_eos + non-block-stream only.")
+    inf.add_argument("--ar_draft_max", type=int, default=2,
+                     help="Maximum draft proposal length for AR verifier mode. SAT is capped by SAT_BLOCK.")
     inf.add_argument("--sampler", choices=["ar", "euler"], default="ar", help="ar=KV decode; euler=DiffusionBlocks EDM Euler sampler.")
     inf.add_argument("--euler_steps", type=int, default=0, help="Euler ODE steps (0=2x dblock_blocks).")
     inf.add_argument("--euler_start_sigma", type=float, default=0.0, help="Euler start noise (0=sigma_max; lower=stronger context conditioning).")
@@ -10085,6 +10534,8 @@ def main():
                      help="Use greedy token picks inside NAT mask-predict refinement by default.")
     inf.add_argument("--ignore_eos", action="store_true",
                      help="Never stop on (or sample) EOS: suppress its logit and emit exactly max_new tokens. For base-model / SAT-head testing.")
+    inf.add_argument("--stream", action="store_true",
+                     help="Emit [STREAM_*] marker lines per committed token for live UI rendering (plain-output only).")
     # ── SwiReasoning: entropy-gated explicit/latent AR decode ──────────────────
     inf.add_argument("--swi_reasoning", action="store_true",
                      help="Enable SwiReasoning: alternate between explicit token CoT and silent latent reasoning, gated by next-token entropy. AR + plain KV decode only.")
