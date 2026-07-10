@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 import time
@@ -146,6 +147,84 @@ def _script_argv() -> str:
     return " ".join(sys.argv)
 
 
+def _read_proc_cmdline(pid: str = "self") -> str:
+    try:
+        raw = pathlib.Path("/proc") / str(pid) / "cmdline"
+        data = raw.read_bytes()
+        return " ".join(part.decode("utf-8", "replace") for part in data.split(b"\0") if part)
+    except Exception:
+        return ""
+
+
+def _safe_env_snapshot() -> dict:
+    """Capture useful launch env without leaking tokens or credentials."""
+    prefixes = ("AGILLM", "CUDA_", "HF_HUB_", "HF_DATASETS_", "PYTORCH_", "OMP_", "MKL_")
+    allow = {
+        "CUDA_VISIBLE_DEVICES",
+        "HF_HUB_DISABLE_XET",
+        "HF_DATASETS_TRUST_REMOTE_CODE",
+        "PYTORCH_CUDA_ALLOC_CONF",
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+    }
+    secret_fragments = ("TOKEN", "SECRET", "PASSWORD", "PASSWD", "KEY", "CREDENTIAL", "AUTH", "COOKIE")
+    out = {}
+    for key, value in sorted(os.environ.items()):
+        if not (key in allow or key.startswith(prefixes)):
+            continue
+        if any(fragment in key.upper() for fragment in secret_fragments):
+            out[key] = "<redacted>"
+        else:
+            out[key] = str(value)[:2048]
+    return out
+
+
+def _redact_text(text: str) -> str:
+    secret_fragments = ("TOKEN", "SECRET", "PASSWORD", "PASSWD", "API_KEY", "AUTH", "COOKIE")
+    lines = []
+    for line in str(text).splitlines()[:240]:
+        upper = line.upper()
+        if any(fragment in upper for fragment in secret_fragments):
+            lines.append("<redacted secret-bearing line>")
+        else:
+            lines.append(line[:4096])
+    return "\n".join(lines)
+
+
+def _launch_metadata() -> dict:
+    meta = {
+        "schema": "agillm.launch.v1",
+        "argv": list(sys.argv),
+        "argv_string": _script_argv(),
+        "cwd": "",
+        "pid": os.getpid(),
+        "ppid": os.getppid(),
+        "proc_cmdline": _read_proc_cmdline("self"),
+        "parent_proc_cmdline": _read_proc_cmdline(str(os.getppid())),
+        "env": _safe_env_snapshot(),
+    }
+    try:
+        meta["cwd"] = str(pathlib.Path.cwd())
+    except Exception:
+        pass
+    launch_script = os.environ.get("AGILLM43_LAUNCH_SCRIPT") or os.environ.get("AGILLM_LAUNCH_SCRIPT") or ""
+    launch_command = os.environ.get("AGILLM43_LAUNCH_COMMAND") or os.environ.get("AGILLM_LAUNCH_COMMAND") or ""
+    if launch_command:
+        meta["launch_command"] = _redact_text(launch_command)
+    if launch_script:
+        sp = pathlib.Path(launch_script)
+        info = {"path": str(sp)}
+        try:
+            if sp.exists() and sp.is_file():
+                info["size_bytes"] = sp.stat().st_size
+                info["sha256"] = _sha256_file(sp)
+                info["preview_redacted"] = _redact_text(sp.read_text(errors="replace"))
+        except Exception as exc:
+            info["error"] = str(exc)
+        meta["launch_script"] = info
+    return meta
+
+
 def _infer_samples(core, ar_h, sat_h, tok, device: str, prompt_texts: List[str],
                    max_new: int = 32, temperature: float = 0.5, top_k: int = 20) -> List[dict]:
     """Generate a few short inference samples from the model.
@@ -264,6 +343,7 @@ def collect(args, *, step: int, seen_tok: int, loss: float,
         "block_size": int(block_size),
         "train_script": script_name,
         "train_argv": _script_argv(),
+        "launch": _launch_metadata(),
         "gpu": _gpu_metrics(),
     }
 

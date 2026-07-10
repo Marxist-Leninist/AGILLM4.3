@@ -164,13 +164,14 @@ class FusedCE(torch.autograd.Function):
                 if ic.any():
                     zt[ic] = lg[ic, tgt[ic] - c].float()
             lse = m + torch.log(s)
-            ctx.save_for_backward(h, W, tgt, lse)
+            log_pt = zt - lse
+            ctx.save_for_backward(h, W, tgt, lse, log_pt)
             ctx.vchunk = vchunk
-            return (lse - zt).mean()
+            return (-log_pt).mean()
 
     @staticmethod
     def backward(ctx, go):
-        h, W, tgt, lse = ctx.saved_tensors
+        h, W, tgt, lse, log_pt = ctx.saved_tensors
         vc = ctx.vchunk
         N, d = h.shape
         V = W.shape[0]
@@ -179,7 +180,13 @@ class FusedCE(torch.autograd.Function):
             Wc_all = W.float()
             gh = torch.zeros_like(hf)
             gW = torch.zeros(W.shape, device=W.device, dtype=torch.float32)
-            sc = float(go) / N
+            
+            sc_base = float(go) / N
+            pt = torch.exp(log_pt)
+            gamma = 1.0
+            St = (1.0 - pt)**gamma - gamma * pt * (1.0 - pt)**(gamma - 1.0) * log_pt
+            sc = sc_base * St[:, None]
+            
             for c in range(0, V, vc):
                 Wc = Wc_all[c:c+vc]
                 p = torch.exp(hf @ Wc.T - lse[:, None])     # softmax chunk [N,vchunk]
@@ -1636,7 +1643,7 @@ if (
 
 STATUS_SCRIPT_PATH = Path(__file__).resolve()
 STATUS_DEFAULT_LOG = STATUS_SCRIPT_PATH.parent / "train.log"
-STATUS_DEFAULT_SAVE_DIR = STATUS_SCRIPT_PATH.parent / "ckpts_expansion"
+STATUS_DEFAULT_SAVE_DIR = pathlib.Path("/workspace/agillm4_3090ti_fedC_recovery_lang_v100a0_243186_ckpts")
 _STATUS_PROGRESS_RE = re.compile(
     r"^\[(?P<percent>\d+(?:\.\d+)?)%\]\s+"
     r"(?P<seen>[\d,]+)/(?P<target>[\d,]+)\s+tok\s+\|\s+"
@@ -3115,7 +3122,7 @@ DEFAULT_SAVE_SEC = 24 * 3600
 DEFAULT_DELTA_STEPS = 0          # step-triggered delta saves disabled; use DEFAULT_DELTA_SEC
 DEFAULT_DELTA_SEC = int(os.environ.get("AGILLM43_DELTA_EVERY_SEC", "3600"))  # lightweight weight-only save every N seconds
 DEFAULT_MAX_DELTAS = 5         # keep last N deltas (older pruned after full save)
-CKDIR = pathlib.Path("ckpts_expansion")
+CKDIR = pathlib.Path("agillm4_3090ti_fedC_recovery_lang_v100a0_243186_ckpts")
 
 DEFAULT_PRETRAIN_SOURCES = "LLM360/TxT360,OpenTransformer/goddess-crawl,OpenTransformer/agillm-crawl-data,OpenTransformer/web-crawl-2026,OpenTransformer/web-crawl-clean-v2,OpenTransformer/scraped-web-data,OpenTransformer/turbo-crawl,OpenTransformer/sft-data-clean,OpenTransformer/web-crawl-v1,HuggingFaceFW/fineweb,wikimedia/wikipedia:20231101.en,allenai/c4:en,EleutherAI/proof-pile-2"
 DEFAULT_AFTER_SFT_SOURCES = "mlabonne/opc-sft-stage2-chat,HuggingFaceH4/ultrachat_200k@train_sft"
@@ -6579,6 +6586,7 @@ def _build_val_set(source, chat_cfg, args, block):
 
 
 def _run_validation(core, ar_h, val_batches, args, step):
+    return
     """Full-stack AR cross-entropy on the fixed held-out batches (no_grad, eval mode)."""
     if not val_batches:
         return None
@@ -7373,7 +7381,7 @@ def _optimizer_param_groups(core, ar_h, sat_h, lr_core: float, lr_head: float, n
             seen.add(key)
             unique.append(p)
         if unique:
-            groups.append({"params": unique, "lr": lr})
+            groups.append({"params": unique, "lr": lr, "base_lr": lr})
     add(core.parameters(), lr_core)
     add(ar_h.parameters(), lr_head)
     add(sat_h.parameters(), lr_head)
@@ -7978,6 +7986,14 @@ def _train_phase(
         except Exception:
             pass
     while seen_tok < total_tokens_needed:
+        # AGILLM-LR-DECAY 20260706: cosine multiplier from seen_tok; no-op when lr_decay=none
+        if getattr(args, "lr_decay", "none") == "cosine":
+            _lrT = float(getattr(args, "lr_decay_tokens", 0.0) or total_tokens_needed)
+            _lrfrac = min(1.0, max(0.0, float(seen_tok) / max(_lrT, 1.0)))
+            _lrfloor = float(getattr(args, "lr_min_mult", 0.10))
+            _lrmult = _lrfloor + (1.0 - _lrfloor) * 0.5 * (1.0 + math.cos(math.pi * _lrfrac))
+            for _lrg in opt.param_groups:
+                _lrg["lr"] = _lrg.get("base_lr", _lrg["lr"]) * _lrmult
         _profile_batch = _DBS is not None and int(getattr(args, "profile_steps", 0) or 0) > 0 and int(_DBS.get("profile_n", 0)) < int(getattr(args, "profile_steps", 0) or 0)
         _data_t = time.perf_counter() if _profile_batch else None
         loss_mask = None
@@ -8284,7 +8300,7 @@ def _train_phase(
                 print(f"[heartbeat-json] warning: {exc}", flush=True)
             print(
                 f"[heartbeat] phase={phase_name} pid={os.getpid()} step={step} "
-                f"seen_tok={seen_tok} loss={loss_value:.3f} B={BATCH} L={BLOCK} "
+                f"seen_tok={seen_tok} loss={loss_value:.3f} lr={opt.param_groups[0].get('lr'):.2e} B={BATCH} L={BLOCK} "
                 f"dblock={bool(getattr(args, 'dblock', False))} structured_masks={use_structured_masks(args)}{mem}",
                 flush=True,
             )
@@ -10617,6 +10633,14 @@ def main():
     tr.add_argument("--train_emb", action="store_true")
     tr.add_argument("--lr_core", type=float, default=LR_CORE)
     tr.add_argument("--lr_head", type=float, default=LR_HEAD)
+    # AGILLM-LR-DECAY 20260706 (claude-fable, for Scott: fix verified constant-LR val-CE
+    # plateau, memory agillm43-lr-plateau-rootcause). Default-off: inert unless
+    # --lr_decay cosine is passed. Anchored to seen_tok so the schedule survives
+    # delta-resume relaunches at the correct point in the curve.
+    tr.add_argument("--lr_decay", choices=["none", "cosine"], default="none")
+    tr.add_argument("--lr_min_mult", type=float, default=0.10)
+    tr.add_argument("--lr_decay_tokens", type=float, default=0.0,
+                    help="Token horizon for LR decay; 0 = phase total_tokens_needed.")
     tr.add_argument("--chat", action="store_true")
     tr.add_argument("--chat_messages_key", default="messages")
     tr.add_argument("--dataset_field_text", default="text")
