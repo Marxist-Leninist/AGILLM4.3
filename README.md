@@ -67,6 +67,15 @@ python3 agillm41.py infer ... --mode sat
 python3 agillm41.py infer ... --mode nat
 ```
 
+### Streaming
+
+Generation can be **streamed token-by-token** as it decodes, in all three modes (AR / SAT / NAT):
+
+- **CLI:** add `--block_stream` (shown above) to emit tokens/blocks to stdout as they are produced, instead of waiting for the whole completion.
+- **Server mode:** run `python3 agillm41.py infer --server` and send a request with `"stream": true`. The server replies with newline-delimited JSON (NDJSON): a `stream_begin` event, one `stream_tok` event per decoded piece (`{"i": N, "text": "..."}`), a `stats` line, and a final `done` event carrying the full text. This is what drives the live "typewriter" playground UI.
+
+Streaming changes only *how* output is delivered, not *what* is generated, so the throughput figures below are unchanged — it simply makes latency visible as the text appears rather than arriving all at once.
+
 > **Note:** If both GPUs are busy with training, add `CUDA_VISIBLE_DEVICES=""` to force CPU inference (slow but functional: ~1.2 tok/s).
 
 > **Dependency:** `agillm_checkpoint_provenance.py` must be in the same directory as `agillm41.py`.
