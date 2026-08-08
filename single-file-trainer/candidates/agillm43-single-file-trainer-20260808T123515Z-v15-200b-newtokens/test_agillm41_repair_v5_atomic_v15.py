@@ -310,6 +310,16 @@ def test_production_preflight_is_upfront_and_exact():
     assert "val_file" not in source
 
 
+def test_production_heldout_is_optional_telemetry():
+    source = function_source("_build_val_set")
+    assert "_production_continuation_active" in source
+    assert "validation telemetry disabled" in source
+    assert "without blocking training" in source
+    assert source.index("if production_continuation:") < source.index(
+        "_build_val_set_legacy"
+    )
+
+
 def test_production_checkpoint_pointer_contract():
     save_source = function_source("save_ckpt")
     assert "production checkpoint requires DBlock resume state" in save_source
@@ -364,6 +374,7 @@ def main():
         test_no_finite_quality_control_sinks,
         test_exact_child_resume_and_restore_order,
         test_production_preflight_is_upfront_and_exact,
+        test_production_heldout_is_optional_telemetry,
         test_production_checkpoint_pointer_contract,
         lambda: test_legacy_quality_file_cannot_pin(mod),
     ]

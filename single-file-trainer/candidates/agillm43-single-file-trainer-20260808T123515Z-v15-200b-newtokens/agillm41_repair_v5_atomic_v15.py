@@ -12866,12 +12866,24 @@ def _repair_preflight(args, *, stage="startup", loaded_step=None, val_batches=No
 def _build_val_set(source, chat_cfg, args, block):
     """Load a checksum-pinned frozen set; legacy runs may still build-and-freeze once."""
     strict = bool(getattr(args, "repair_mode", False))
+    production_continuation = bool(
+        getattr(args, "_production_continuation_active", False)
+    )
     path = _repair_val_path(args)
     expected = _repair_val_expected_sha256(args)
     try:
         receipt = _repair_verify_val_file(args, require=strict)
-    except Exception:
-        if strict or expected:
+    except Exception as exc:
+        if strict:
+            raise
+        if production_continuation:
+            print(
+                "[quality-telemetry] optional heldout input is unavailable or "
+                f"malformed ({type(exc).__name__}); validation telemetry disabled",
+                flush=True,
+            )
+            return []
+        if expected:
             raise
         receipt = None
     if receipt is not None:
@@ -12892,6 +12904,13 @@ def _build_val_set(source, chat_cfg, args, block):
         return batches
     if strict:
         raise RuntimeError("repair validation must load an existing checksum-pinned frozen set")
+    if production_continuation:
+        print(
+            "[quality-telemetry] optional heldout input is absent; validation "
+            "telemetry disabled without blocking training",
+            flush=True,
+        )
+        return []
 
     batches = _build_val_set_legacy(source, chat_cfg, args, block)
     if path is not None and batches and not path.exists():

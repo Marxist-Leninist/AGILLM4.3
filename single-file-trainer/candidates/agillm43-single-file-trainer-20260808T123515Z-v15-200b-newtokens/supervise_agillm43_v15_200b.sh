@@ -2,7 +2,7 @@
 set -euo pipefail
 
 LAUNCHER=/workspace/agillm43_v15_release/launch_agillm43_v15_200b.sh
-LAUNCHER_SHA=1098fc52ed119b8abf8cd13807c59095ea2d22889610bf4e2cd7cf016b2e966d
+LAUNCHER_SHA=ac83e7c073e15d98fb4dcc44471ca5ffd93cfe9f7379ee1c6e938f7ae2768c12
 SAVE_DIR=/workspace/agillm43_production_v15_200b
 STATE=${SAVE_DIR}/run_state.json
 LATEST=${SAVE_DIR}/training_latest.json
