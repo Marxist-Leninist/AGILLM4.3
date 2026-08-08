@@ -1,6 +1,10 @@
 {
   "created_london": "2026-08-08T03:11:05.890076+01:00",
   "created_utc": "2026-08-08T02:11:05.890076Z",
+  "current_training_state": "safety-stopped",
+  "first_committed_step": 1729311,
+  "last_verified_child_step": 1729402,
+  "last_verified_seen_tokens": 85003567104,
   "live_command": [
     "/opt/conda/bin/python",
     "-u",
@@ -224,16 +228,20 @@
   "live_process_present": true,
   "live_run_dir": "/workspace/agillm43_repair_production_v3/runs/run_20260808T020744Z_from_step01729310_82400",
   "live_source_path": "/workspace/agillm43_runtime/agillm41_repair_v3.py",
+  "post_snapshot_verification": "ran 92 committed optimiser steps, saved step 1729402, then fail-closed during child-resume validation",
   "quality_note": "Repair training is live; public serving remains pinned to protected step 1729310 until quality gates pass.",
   "release_id": "agillm43-single-file-trainer-20260808T031105BST-20260808T021105Z-db3c95ffd5a9",
   "resume_checkpoint": "/workspace/agillm43_repretrain_v4_ckpts/pretrain_step01729310_from01695324_20260808T0011Z.pt",
   "resume_checkpoint_sha256": "ea90d4f2ddfa1b81e7ab782df02b4f023107f7595b26dfee82818f4c225cb1d1",
   "resume_step": 1729310,
+  "safety_stop_reason": "initial child-resume AR validation regression",
   "schema": "agillm43.single_file_trainer.release.v1",
   "source_bytes": 810901,
   "source_filename": "agillm41_repair_v3_single_file_20260808T031105BST_20260808T021105Z.py",
   "source_sha256": "db3c95ffd5a9845ac2943e17362c09cbb76451681eef4147f71c7ff2536dd7c5",
   "target_tokens": 134000000000,
   "timezone_label": "BST",
-  "training_status_at_snapshot": "process-live; baseline-validation-complete; first-commit-pending"
+  "training_status_at_snapshot": "process-live; baseline-validation-complete",
+  "verification_london": "2026-08-08T03:18:43.822540+01:00",
+  "verification_utc": "2026-08-08T02:18:43.822540Z"
 }

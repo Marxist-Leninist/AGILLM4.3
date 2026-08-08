@@ -1,0 +1,31 @@
+{
+  "allowed_regression_ce": 0.75,
+  "child_resume_ar_ce": 12.1834,
+  "child_resume_contract_loaded": true,
+  "child_resume_selected_step": 1729402,
+  "committed_steps_in_proof_run": 92,
+  "finite_fullstack_anchors": [
+    "AR",
+    "SAT shift-2",
+    "NAT clean-suffix"
+  ],
+  "first_committed_step": 1729311,
+  "last_committed_step": 1729402,
+  "last_seen_tokens": 85003567104,
+  "note": "The source release is valid and reproduced live training. Training is deliberately safety-stopped pending continuity diagnosis; no checkpoint or optimiser history was erased.",
+  "public_serving_remains_pinned_step": 1729310,
+  "reference_ar_ce": 11.2733,
+  "release_id": "agillm43-single-file-trainer-20260808T031105BST-20260808T021105Z-db3c95ffd5a9",
+  "safety_gate_reason": "AR validation regression exceeded limit",
+  "safety_gate_result": "STOP",
+  "saved_checkpoints": [
+    1729311,
+    1729402
+  ],
+  "schema": "agillm43.single_file_trainer.run_verification.v1",
+  "seed_seen_tokens": 84999045120,
+  "seed_step": 1729310,
+  "source_sha256": "db3c95ffd5a9845ac2943e17362c09cbb76451681eef4147f71c7ff2536dd7c5",
+  "verified_london": "2026-08-08T03:18:43.822540+01:00",
+  "verified_utc": "2026-08-08T02:18:43.822540Z"
+}
