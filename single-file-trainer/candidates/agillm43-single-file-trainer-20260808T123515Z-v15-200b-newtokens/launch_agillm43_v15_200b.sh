@@ -4,7 +4,7 @@ set -euo pipefail
 PYTHON=/opt/conda/bin/python3
 TRAINER=/workspace/agillm43_v15_release/agillm41_repair_v5_atomic_v15.py
 TRAINER_SHA=efb6847ec10177a3c7c6bedfe531f12dce608252128df64b8ea1c10ec6029216
-SEED=/workspace/agillm43_repretrain_v4_ckpts/pretrain_step01729310_from01695324_20260808T0011Z.pt
+SEED=/workspace/agillm43_seed_verified/checkpoints/pretrain_step01729310_from01695324_20260808T0011Z.pt
 SEED_SHA=ea90d4f2ddfa1b81e7ab782df02b4f023107f7595b26dfee82818f4c225cb1d1
 SAVE_DIR=/workspace/agillm43_production_v15_200b
 LATEST=${SAVE_DIR}/training_latest.json
