@@ -40,7 +40,7 @@ jobs:
         run: |
           python tools/patch_dblock_stratified_objectives.py agillm41.py --output /tmp/agillm41.stratified.py
           python -m py_compile /tmp/agillm41.stratified.py
-          grep -q 'AGILLM43-DBLOCK-STRATIFIED-OBJECTIVES-v1' /tmp/agillm41.stratified.py
+          grep -q 'AGILLM43-DBLOCK-STRATIFIED-OBJECTIVES-v2' /tmp/agillm41.stratified.py
           grep -q 'block_idx=bi' /tmp/agillm41.stratified.py
 
       - name: Verify archived production trainer remains patch-compatible
@@ -48,7 +48,7 @@ jobs:
           LIVE='single-file-trainer/releases/agillm43-single-file-trainer-20260808T031105BST-20260808T021105Z-db3c95ffd5a9/agillm41_repair_v3_single_file_20260808T031105BST_20260808T021105Z.py'
           python tools/patch_dblock_stratified_objectives.py "$LIVE" --output /tmp/agillm41_repair_v3.stratified.py
           python -m py_compile /tmp/agillm41_repair_v3.stratified.py
-          grep -q 'AGILLM43-DBLOCK-STRATIFIED-OBJECTIVES-v1' /tmp/agillm41_repair_v3.stratified.py
+          grep -q 'AGILLM43-DBLOCK-STRATIFIED-OBJECTIVES-v2' /tmp/agillm41_repair_v3.stratified.py
 
       - name: Verify 50-25-25 quota invariant
         run: |
