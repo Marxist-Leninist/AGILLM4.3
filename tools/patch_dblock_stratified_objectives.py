@@ -13,13 +13,31 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-MARKER = "AGILLM43-DBLOCK-STRATIFIED-OBJECTIVES-v1"
+MARKER_V1 = "AGILLM43-DBLOCK-STRATIFIED-OBJECTIVES-v1"
+MARKER = "AGILLM43-DBLOCK-STRATIFIED-OBJECTIVES-v2"
 
 SIG_OLD = "def _choose_objectives(state, args, ar_weight, sat_weight, nat_weight, do_sat_periodic, do_nat_periodic):"
 SIG_NEW = "def _choose_objectives(state, args, ar_weight, sat_weight, nat_weight, do_sat_periodic, do_nat_periodic, block_idx=None):"
 
 PICK_OLD = '    picked = random.choices(choices, weights=probs, k=1)[0]\n'
-PICK_NEW = '''    # AGILLM43-DBLOCK-STRATIFIED-OBJECTIVES-v1
+SIGNATURE_V1 = '''        signature = (
+            tuple(choices),
+            tuple(round(float(p), 12) for p in probs),
+            int(window),
+        )
+'''
+SIGNATURE_V2 = '''        assign_signature = tuple(
+            tuple(int(layer) for layer in group) for group in state.get("assign", [])
+        )
+        signature = (
+            tuple(choices),
+            tuple(round(float(p), 12) for p in probs),
+            int(window),
+            int(state.get("B", -1)),
+            assign_signature,
+        )
+'''
+PICK_NEW = '''    # AGILLM43-DBLOCK-STRATIFIED-OBJECTIVES-v2
     # IID categorical draws preserve the global objective mix only in
     # expectation. With many DBlocks that creates unnecessary short-window
     # block*objective starvation. Build a shuffled, per-block quota window
@@ -28,10 +46,15 @@ PICK_NEW = '''    # AGILLM43-DBLOCK-STRATIFIED-OBJECTIVES-v1
     if bool(getattr(args, "dblock_objective_stratified", True)) and len(choices) > 1:
         window = max(len(choices), int(getattr(args, "dblock_objective_strata_window", 16) or 16))
         key = int(block_idx) if block_idx is not None else -1
+        assign_signature = tuple(
+            tuple(int(layer) for layer in group) for group in state.get("assign", [])
+        )
         signature = (
             tuple(choices),
             tuple(round(float(p), 12) for p in probs),
             int(window),
+            int(state.get("B", -1)),
+            assign_signature,
         )
         if state.get("objective_strata_signature") != signature:
             state["objective_strata_signature"] = signature
@@ -83,6 +106,19 @@ ARG_INSERT = '''    tr.add_argument("--dblock_objective_stratified", action=argp
 def apply_upgrade(text: str) -> str:
     if MARKER in text:
         return text
+
+    # Migrate the first tested implementation without touching any other
+    # trainer code. Block identity must be part of the signature because
+    # hot/auto DBlock re-partitioning can reuse the same numeric block index.
+    if MARKER_V1 in text:
+        if SIGNATURE_V1 not in text:
+            raise RuntimeError("v1 marker found but v1 strata signature anchor is missing")
+        out = text.replace(MARKER_V1, MARKER, 1)
+        out = out.replace(SIGNATURE_V1, SIGNATURE_V2, 1)
+        if MARKER not in out:
+            raise RuntimeError("v1->v2 migration marker missing")
+        return out
+
     missing = []
     for name, anchor in (
         ("objective signature", SIG_OLD),
