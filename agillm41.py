@@ -1307,7 +1307,7 @@ def _choose_objectives(state, args, ar_weight, sat_weight, nat_weight, do_sat_pe
         probs = [1.0 / len(choices) for _ in choices]
     else:
         probs = [p / total for p in probs]
-    # AGILLM43-DBLOCK-STRATIFIED-OBJECTIVES-v1
+    # AGILLM43-DBLOCK-STRATIFIED-OBJECTIVES-v2
     # IID categorical draws preserve the global objective mix only in
     # expectation. With many DBlocks that creates unnecessary short-window
     # block*objective starvation. Build a shuffled, per-block quota window
@@ -1316,10 +1316,15 @@ def _choose_objectives(state, args, ar_weight, sat_weight, nat_weight, do_sat_pe
     if bool(getattr(args, "dblock_objective_stratified", True)) and len(choices) > 1:
         window = max(len(choices), int(getattr(args, "dblock_objective_strata_window", 16) or 16))
         key = int(block_idx) if block_idx is not None else -1
+        assign_signature = tuple(
+            tuple(int(layer) for layer in group) for group in state.get("assign", [])
+        )
         signature = (
             tuple(choices),
             tuple(round(float(p), 12) for p in probs),
             int(window),
+            int(state.get("B", -1)),
+            assign_signature,
         )
         if state.get("objective_strata_signature") != signature:
             state["objective_strata_signature"] = signature
