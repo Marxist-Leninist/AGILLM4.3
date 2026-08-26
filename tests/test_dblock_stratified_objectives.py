@@ -84,7 +84,7 @@ class StratifiedObjectiveTests(unittest.TestCase):
         _, ns = load_patched_namespace()
         choose = ns["_choose_objectives"]
         args = self.args()
-        state = {}
+        state = {"B": 14, "assign": [[2 * i, 2 * i + 1] for i in range(14)]}
         random.seed(12345)
         for block in range(14):
             counts = Counter()
@@ -102,7 +102,7 @@ class StratifiedObjectiveTests(unittest.TestCase):
             dblock_objective_strata_window=17,
         )
         random.seed(7)
-        state = {}
+        state = {"B": 4, "assign": [[0], [1], [2], [3]]}
         counts = Counter(
             choose(state, args, 1.0, 1.0, 1.0, True, True, block_idx=3)[3]
             for _ in range(17)
@@ -115,7 +115,7 @@ class StratifiedObjectiveTests(unittest.TestCase):
     def test_probability_change_invalidates_old_queue(self):
         _, ns = load_patched_namespace()
         choose = ns["_choose_objectives"]
-        state = {}
+        state = {"B": 4, "assign": [[0], [1], [2], [3]]}
         random.seed(19)
         a = self.args()
         for _ in range(3):
@@ -125,10 +125,25 @@ class StratifiedObjectiveTests(unittest.TestCase):
         choose(state, b, 1.0, 1.0, 1.0, True, True, block_idx=2)
         self.assertNotEqual(old_sig, state["objective_strata_signature"])
 
+    def test_block_repartition_invalidates_old_queue(self):
+        _, ns = load_patched_namespace()
+        choose = ns["_choose_objectives"]
+        args = self.args()
+        state = {"B": 2, "assign": [[0, 1], [2, 3]]}
+        random.seed(23)
+        for _ in range(3):
+            choose(state, args, 1.0, 1.0, 1.0, True, True, block_idx=0)
+        old_sig = state["objective_strata_signature"]
+        old_queue = list(state["objective_strata_queues"][0])
+        state["assign"] = [[0, 2], [1, 3]]
+        choose(state, args, 1.0, 1.0, 1.0, True, True, block_idx=0)
+        self.assertNotEqual(old_sig, state["objective_strata_signature"])
+        self.assertNotEqual(old_queue, state["objective_strata_queues"][0])
+
     def test_iid_escape_hatch_still_works(self):
         _, ns = load_patched_namespace()
         choose = ns["_choose_objectives"]
-        state = {}
+        state = {"B": 1, "assign": [[0]]}
         args = self.args(dblock_objective_stratified=False)
         random.seed(4)
         out = [choose(state, args, 1.0, 1.0, 1.0, True, True, block_idx=0)[3] for _ in range(20)]
