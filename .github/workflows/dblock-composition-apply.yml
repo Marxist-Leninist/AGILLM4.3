@@ -1,0 +1,44 @@
+name: Apply DBlock composition v2
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/dblock-composition-v2-20260826
+    paths:
+      - '.github/workflows/dblock-composition-apply.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/dblock-composition-v2-20260826
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Apply and compile checkpoint-compatible trainer upgrade
+        run: |
+          python tools/patch_dblock_stratified_objectives.py agillm41.py --in-place
+          python -m py_compile agillm41.py
+          python -m unittest tests.test_dblock_stratified_objectives -v
+          git diff --check
+
+      - name: Commit upgraded trainer source
+        run: |
+          if git diff --quiet -- agillm41.py; then
+            echo 'trainer already upgraded'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add agillm41.py
+          git commit -m 'feat: stratify stochastic DBlock objectives per block'
+          git push origin HEAD:codex/dblock-composition-v2-20260826
