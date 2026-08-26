@@ -3,11 +3,19 @@ name: DBlock composition v2
 on:
   workflow_dispatch:
   push:
-    branches:
-      - codex/dblock-composition-v2-20260826
+    branches: [main]
     paths:
+      - 'agillm41.py'
       - 'tools/patch_dblock_stratified_objectives.py'
       - 'tests/test_dblock_stratified_objectives.py'
+      - 'research/dblock_composition_bench.py'
+      - '.github/workflows/dblock-composition-v2.yml'
+  pull_request:
+    paths:
+      - 'agillm41.py'
+      - 'tools/patch_dblock_stratified_objectives.py'
+      - 'tests/test_dblock_stratified_objectives.py'
+      - 'research/dblock_composition_bench.py'
       - '.github/workflows/dblock-composition-v2.yml'
 
 permissions:
@@ -25,24 +33,24 @@ jobs:
 
       - name: Compile patcher and unit tests
         run: |
-          python -m py_compile tools/patch_dblock_stratified_objectives.py tests/test_dblock_stratified_objectives.py
+          python -m py_compile tools/patch_dblock_stratified_objectives.py tests/test_dblock_stratified_objectives.py research/dblock_composition_bench.py
           python -m unittest tests.test_dblock_stratified_objectives -v
 
-      - name: Patch current mainline trainer copy
+      - name: Validate upgraded trainer source
         run: |
           python tools/patch_dblock_stratified_objectives.py agillm41.py --output /tmp/agillm41.stratified.py
           python -m py_compile /tmp/agillm41.stratified.py
           grep -q 'AGILLM43-DBLOCK-STRATIFIED-OBJECTIVES-v1' /tmp/agillm41.stratified.py
           grep -q 'block_idx=bi' /tmp/agillm41.stratified.py
 
-      - name: Patch archived production-repair trainer copy
+      - name: Verify archived production trainer remains patch-compatible
         run: |
           LIVE='single-file-trainer/releases/agillm43-single-file-trainer-20260808T031105BST-20260808T021105Z-db3c95ffd5a9/agillm41_repair_v3_single_file_20260808T031105BST_20260808T021105Z.py'
           python tools/patch_dblock_stratified_objectives.py "$LIVE" --output /tmp/agillm41_repair_v3.stratified.py
           python -m py_compile /tmp/agillm41_repair_v3.stratified.py
           grep -q 'AGILLM43-DBLOCK-STRATIFIED-OBJECTIVES-v1' /tmp/agillm41_repair_v3.stratified.py
 
-      - name: Verify live 50-25-25 quota invariant
+      - name: Verify 50-25-25 quota invariant
         run: |
           python - <<'PY'
           import math, random
