@@ -1285,7 +1285,7 @@ def _sample_token_loss_inputs(hidden, targets, max_tokens, loss_mask=None):
     return flat_hidden.index_select(0, idx).contiguous(), flat_targets.index_select(0, idx).contiguous(), int(max_tokens), total
 
 
-def _choose_objectives(state, args, ar_weight, sat_weight, nat_weight, do_sat_periodic, do_nat_periodic):
+def _choose_objectives(state, args, ar_weight, sat_weight, nat_weight, do_sat_periodic, do_nat_periodic, block_idx=None):
     mode = str(getattr(args, "dblock_objective_mode", "periodic") or "periodic").lower()
     if mode != "stochastic":
         return ar_weight > 0.0, sat_weight > 0.0 and do_sat_periodic, nat_weight > 0.0 and do_nat_periodic, "periodic"
@@ -1307,7 +1307,52 @@ def _choose_objectives(state, args, ar_weight, sat_weight, nat_weight, do_sat_pe
         probs = [1.0 / len(choices) for _ in choices]
     else:
         probs = [p / total for p in probs]
-    picked = random.choices(choices, weights=probs, k=1)[0]
+    # AGILLM43-DBLOCK-STRATIFIED-OBJECTIVES-v2
+    # IID categorical draws preserve the global objective mix only in
+    # expectation. With many DBlocks that creates unnecessary short-window
+    # block*objective starvation. Build a shuffled, per-block quota window
+    # instead. Systematic randomized rounding keeps E[quota_j] = W * p_j,
+    # while shuffling avoids a fixed AR/SAT/NAT cycle.
+    if bool(getattr(args, "dblock_objective_stratified", True)) and len(choices) > 1:
+        window = max(len(choices), int(getattr(args, "dblock_objective_strata_window", 16) or 16))
+        key = int(block_idx) if block_idx is not None else -1
+        assign_signature = tuple(
+            tuple(int(layer) for layer in group) for group in state.get("assign", [])
+        )
+        signature = (
+            tuple(choices),
+            tuple(round(float(p), 12) for p in probs),
+            int(window),
+            int(state.get("B", -1)),
+            assign_signature,
+        )
+        if state.get("objective_strata_signature") != signature:
+            state["objective_strata_signature"] = signature
+            state["objective_strata_queues"] = {}
+        queues = state.setdefault("objective_strata_queues", {})
+        queue = queues.get(key)
+        if not queue:
+            u = random.random()
+            edge = 0.0
+            quota = []
+            for name, prob in zip(choices, probs):
+                next_edge = edge + float(prob) * float(window)
+                n_pick = int(math.floor(next_edge + u) - math.floor(edge + u))
+                if n_pick > 0:
+                    quota.extend([name] * n_pick)
+                edge = next_edge
+            # Systematic rounding should sum exactly to W; keep an explicit
+            # numerical guard instead of trusting accumulated float error.
+            if len(quota) < window:
+                quota.extend([choices[-1]] * (window - len(quota)))
+            elif len(quota) > window:
+                del quota[window:]
+            random.shuffle(quota)
+            queue = quota
+            queues[key] = queue
+        picked = queue.pop()
+    else:
+        picked = random.choices(choices, weights=probs, k=1)[0]
     return picked == "ar", picked == "sat", picked == "nat", picked
 
 
@@ -1361,7 +1406,8 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state, loss_m
         )
     )
     run_ar, run_sat, run_nat, objective = _choose_objectives(
-        state, args, ar_weight, sat_weight, nat_weight, do_sat_periodic, do_nat_periodic
+        state, args, ar_weight, sat_weight, nat_weight, do_sat_periodic, do_nat_periodic,
+        block_idx=bi,
     )
     _profile_toc(state, "setup", _setup_t)
 
@@ -10615,6 +10661,10 @@ def main():
     tr.add_argument("--dblock_nat_weight", type=float, default=1.0)
     tr.add_argument("--dblock_objective_mode", choices=["periodic", "stochastic"], default="periodic",
                     help="DBlock objective scheduler. stochastic samples one objective per step to reduce redundant AR/SAT/NAT forwards.")
+    tr.add_argument("--dblock_objective_stratified", action=argparse.BooleanOptionalAction, default=True,
+                    help="Stratify stochastic AR/SAT/NAT draws independently per DBlock using shuffled quota windows; preserves expected objective probabilities while reducing block*objective coverage variance.")
+    tr.add_argument("--dblock_objective_strata_window", type=int, default=16,
+                    help="Per-DBlock shuffled objective quota window for --dblock_objective_stratified.")
     tr.add_argument("--dblock_ar_prob", type=float, default=0.80, help="Stochastic DBlock probability for AR objective.")
     tr.add_argument("--dblock_sat_prob", type=float, default=0.10, help="Stochastic DBlock probability for SAT objective.")
     tr.add_argument("--dblock_nat_prob", type=float, default=0.10, help="Stochastic DBlock probability for NAT objective.")
