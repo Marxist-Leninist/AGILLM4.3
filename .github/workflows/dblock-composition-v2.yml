@@ -1,0 +1,62 @@
+name: DBlock composition v2
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/dblock-composition-v2-20260826
+    paths:
+      - 'tools/patch_dblock_stratified_objectives.py'
+      - 'tests/test_dblock_stratified_objectives.py'
+      - '.github/workflows/dblock-composition-v2.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Compile patcher and unit tests
+        run: |
+          python -m py_compile tools/patch_dblock_stratified_objectives.py tests/test_dblock_stratified_objectives.py
+          python -m unittest tests.test_dblock_stratified_objectives -v
+
+      - name: Patch current mainline trainer copy
+        run: |
+          python tools/patch_dblock_stratified_objectives.py agillm41.py --output /tmp/agillm41.stratified.py
+          python -m py_compile /tmp/agillm41.stratified.py
+          grep -q 'AGILLM43-DBLOCK-STRATIFIED-OBJECTIVES-v1' /tmp/agillm41.stratified.py
+          grep -q 'block_idx=bi' /tmp/agillm41.stratified.py
+
+      - name: Patch archived production-repair trainer copy
+        run: |
+          LIVE='single-file-trainer/releases/agillm43-single-file-trainer-20260808T031105BST-20260808T021105Z-db3c95ffd5a9/agillm41_repair_v3_single_file_20260808T031105BST_20260808T021105Z.py'
+          python tools/patch_dblock_stratified_objectives.py "$LIVE" --output /tmp/agillm41_repair_v3.stratified.py
+          python -m py_compile /tmp/agillm41_repair_v3.stratified.py
+          grep -q 'AGILLM43-DBLOCK-STRATIFIED-OBJECTIVES-v1' /tmp/agillm41_repair_v3.stratified.py
+
+      - name: Verify live 50-25-25 quota invariant
+        run: |
+          python - <<'PY'
+          import math, random
+          probs = [0.50, 0.25, 0.25]
+          window = 16
+          for seed in range(1000):
+              rng = random.Random(seed)
+              u = rng.random()
+              edge = 0.0
+              q = []
+              for p in probs:
+                  nxt = edge + p * window
+                  q.append(math.floor(nxt + u) - math.floor(edge + u))
+                  edge = nxt
+              assert q == [8, 4, 4], (seed, q)
+          print('1000/1000 windows -> [8 AR, 4 SAT, 4 NAT]')
+          PY
